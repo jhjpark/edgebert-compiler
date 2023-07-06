@@ -850,6 +850,43 @@ static void EdgeBert_attention(struct esp_device *dev, struct esp_device *plic_d
     EdgeBert_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, query_mat_2, vaule_mat_1, softmax);
     memcpy(vaule_mat_1, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
 
+    // Highway exit
+    // Index in to layer outputs
+    token_t *input;
+    memcpy(input, value_mat_1, N1 * sizeof(token_t));
+
+    // Intialize linear layer and outputs
+    token_t *we_mat_1;
+    token_t *result_mat_1;
+
+    N0 = 128;
+    M_mat = 128;
+    N1 = 1;
+
+    we_mat_1 = aligned_malloc(N0 * M_mat);
+    result_mat_1 = aligned_malloc(N0 * N1);
+    memset(we_query, 35, N0 * M_mat * sizeof(token_t));
+
+    // Perform matrix multiplication
+    EdgeBert_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, we_mat_1, vaule_mat_1, softmax);
+    memcpy(result_mat_1, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
+
+    // Perform classification
+    token_t *we_mat_2;
+    token_t *result_mat_2;
+
+    N0 = 128;
+    M_mat = 10;
+    N1 = 1;
+
+    we_mat2 = aligned_malloc(N0 * M_mat);
+    memset(we_query, -24, N0 * M_mat * sizeof(token_t));
+
+    // Perform matrix multiplication
+    EdgeBert_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, we_mat_2, result_mat_1, softmax);
+    memcpy(result_mat_2, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
+
+
     aligned_free(input_ids1st);
     aligned_free(input_ids2nd);
     aligned_free(we_mat1);
@@ -1080,8 +1117,8 @@ static void EdgeBert_feed_forward(
     // memset(mask_mat, 255, 8192 * sizeof(token_t));
 
     // Initialize weights
-    token_t* we1_mat; // 768 X 3072
-    token_t* we2_mat; // 3072 X 768
+    token_t* we1_mat; // 768 x 3072
+    token_t* we2_mat; // 3072 x 768
 
     we1_mat = aligned_malloc(768 * 3072);
     we2_mat = aligned_malloc(768 * 3072);
@@ -1121,7 +1158,6 @@ static void EdgeBert_feed_forward(
             // TODO: Need to transpose?
             memcpy(input_2, we1_mat + j * M_mat * N1, M_mat * N1 * sizeof(token_t));
 
-            // QUESTION: What is this for?
             if (count == 2) {
                 EdgeBert_init(dev, plic_dev, mem);
                 count = 0;
@@ -1168,7 +1204,7 @@ static void EdgeBert_feed_forward(
             }
 
             EdgeBert_mat_mul (dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, input_1, input_2, softmax);
-            //memcpy(we2_output + N0 * N1 * i * j, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
+            // memcpy(we2_output + N0 * N1 * i * j, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
 
             for (int l = 0; l < N0; l++) {
                 for (int k = 0; k < N1; k++) {
