@@ -624,6 +624,58 @@ static int EdgeBert_mat_mul(
     return num_interrupts;
 }
 
+static void general_mat_mul(
+    struct esp_device *dev,
+    struct esp_device *plic_dev,
+    int N0,
+    int N1,
+    int M_mat,
+    int is_relu,
+    token_t *mem,
+    token_t *mask_mat,
+    token_t *D_mat1,
+    token_t *D_mat2,
+    int softmax
+) {
+    unsigned N0_tile;
+    unsigned N1_tile;
+
+    N1_tile = input_buffer_size / M_mat;
+    N0_tile = input_buffer_size / (M_mat + N1_tile);
+
+    EdgeBert_init(dev, plic_dev, mem);
+    int count = 0;
+
+    token_t *left;
+    token_t *right;
+    token_t *output;
+    left = aligned_malloc(N0_tile * M_mat);
+    right = aligned_malloc(M_mat * N1_tile);
+    output = aligned_malloc(N0 * N1);
+    CPU_transpose(D_mat2, M_mat, N1);
+
+    int row = 0, col = 0;
+    while (row < N0) {
+        unsigned N0_mat = min(N0_tile, N0 - row);
+        memcpy(left, D_mat1 + M_mat * row, N0_mat * M_mat * sizeof(token_t));
+        while (col < N1) {
+            unsigned N1_mat = min(N1_tile, N1 - col);
+            memcpy(right, D_mat + M_mat * col, N1_mat * M_mat * sizeof(token_t));
+            CPU_transpose(right, N1_mat, M_mat);
+            EdgeBert_mat_mul(dev, plic_dev, N0_mat, N1_mat, M_mat, is_relu, mem, mask_mat, left, right, softmax);
+
+            // Copy over data into relu_output
+            for (int l = 0; l < N0_mat; l++) {
+                for (int k = 0; k < N1_mat; k++) {
+                    relu_output[(row + l) * N1 + col + k] = mem[mask_buffer_size + 2 * input_buffer_size + aux_buffer_size + l * N0_mat + k];
+                }
+            }
+            col += N1_mat;
+        }
+        row += N0_mat;
+    }
+}
+
 // Softmax for attention head
 static int EdgeBert_atten_softmax(
     struct esp_device *dev,
@@ -824,8 +876,8 @@ static void EdgeBert_attention(struct esp_device *dev, struct esp_device *plic_d
     token_t *query_mat_2; // the input for softmax: 128X128
     query_mat_2 = aligned_malloc(2 * N0 * N1);
 
-
     // EdgeBert_init(dev, plic_dev, mem);
+    // Set softmax parameter to true
     softmax = 1;
     EdgeBert_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, query_mat_1, key_mat_1, softmax);
 
@@ -833,10 +885,11 @@ static void EdgeBert_attention(struct esp_device *dev, struct esp_device *plic_d
     aligned_free(query_mat_1);
     aligned_free(key_mat_1);
 
-    // Softmax and attention span
+    // Softmax and attention span configuration
     N0 = 128;
     M_mat = 128;
     N1 = 128;
+
     // Apply softmax
     EdgeBert_atten_softmax(dev, plic_dev, N0, N1, M_mat);
     memcpy(query_mat_2, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
@@ -865,9 +918,10 @@ static void EdgeBert_attention(struct esp_device *dev, struct esp_device *plic_d
 
     we_mat_1 = aligned_malloc(N0 * M_mat);
     result_mat_1 = aligned_malloc(N0 * N1);
-    memset(we_query, 35, N0 * M_mat * sizeof(token_t));
+    memset(we_mat_1, 35, N0 * M_mat * sizeof(token_t));
 
     // Perform matrix multiplication
+    softmax = 0;
     EdgeBert_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, we_mat_1, vaule_mat_1, softmax);
     memcpy(result_mat_1, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
 
@@ -886,7 +940,7 @@ static void EdgeBert_attention(struct esp_device *dev, struct esp_device *plic_d
     EdgeBert_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, we_mat_2, result_mat_1, softmax);
     memcpy(result_mat_2, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
 
-
+    // Free memory
     aligned_free(input_ids1st);
     aligned_free(input_ids2nd);
     aligned_free(we_mat1);
@@ -1162,7 +1216,7 @@ static void EdgeBert_feed_forward(
                 EdgeBert_init(dev, plic_dev, mem);
                 count = 0;
             }
-            EdgeBert_mat_mul (dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, input_1, input_2, softmax);
+            EdgeBert_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, input_1, input_2, softmax);
             // memcpy(relu_output + N0 * N1 * i * j, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
 
             // Copy over data into relu_output
@@ -1203,7 +1257,7 @@ static void EdgeBert_feed_forward(
                 count = 0;
             }
 
-            EdgeBert_mat_mul (dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, input_1, input_2, softmax);
+            EdgeBert_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, input_1, input_2, softmax);
             // memcpy(we2_output + N0 * N1 * i * j, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
 
             for (int l = 0; l < N0; l++) {
@@ -1238,6 +1292,7 @@ static void EdgeBert_feed_forward(
         memcpy(FFN_output + i * N0 * M_mat, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * M_mat * sizeof(token_t));
     }
 
+    // Free memory
     aligned_free(input_1);
     aligned_free(input_2);
     aligned_free(we2_output);
