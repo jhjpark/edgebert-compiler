@@ -96,7 +96,7 @@ static inline uint64_t get_counter() {
 
 
 // CPU functions
-// Transpose a matrix of chars at array with size mxn (in-place)
+// Transpose a matrix of chars at array with original size mxn (in-place)
 void CPU_transpose(token_t *array, int m, int n) {
     token_t new_array[m * n];
     for (int i = 0; i < m; i++) {
@@ -136,7 +136,7 @@ void CPU_transpose_int (int *array, int m, int n) {
     }
 }
 
-// Softmax over array of size size
+// Softmax over array of size size (in-place)
 void CPU_softmax(float* input, size_t size) {
     // Scale down to prevent overflow
     int i;
@@ -181,15 +181,18 @@ void CPU_multiply(int *a, int *b, int N0, int M_mat, int N1, int *d) {
 static void CPU_EdgeBert_attention_profile() {
     // Length of 128 tokens, each token has 768 entries
     int *input_ids;
+
     // Query, key, and value matrices (768 x 64)
     int *we_query;
     int *we_key;
     int *we_val;
+
     // Output of multiplication (128 x 64)
     int *output1;
     int *output2;
     int *output3;
 
+    // Allocate space for matrices
     input_ids = aligned_malloc(128 * 768 * sizeof(int));
     we_query = aligned_malloc(768 * 64 * sizeof(int));
     we_key = aligned_malloc(768 * 64 * sizeof(int));
@@ -213,8 +216,8 @@ static void CPU_EdgeBert_attention_profile() {
     int N0;
     int N1;
     int M_mat;
-
     N0 = 128; M_mat = 768; N1 = 64;
+
     // Query multiplication
     CPU_multiply(input_ids, we_query, N0, M_mat, N1, output1);
     // Key multiplication
@@ -231,6 +234,10 @@ static void CPU_EdgeBert_attention_profile() {
     CPU_multiply(output1, output2, N0, M_mat, N1, output4);
 
     // Softmax?
+    for (int i = 0; i < 128; i++) {
+        CPU_softmax(output4, 128);
+    }
+
     // Attention Span Mask?
 
     // Multiply value output
@@ -239,6 +246,7 @@ static void CPU_EdgeBert_attention_profile() {
     output5 = aligned_malloc(128 * 64 * sizeof(int));
     CPU_multiply(output4, output3, N0, M_mat, N1, output5);
 
+    // Free allocated space
     aligned_free(input_ids);
     aligned_free(we_query);
     aligned_free(we_key);
@@ -252,6 +260,7 @@ static void CPU_EdgeBert_attention_profile() {
 
 // Feed forward neural network after attention heads
 static void CPU_EdgeBert_feed_forward() {
+    // Initialize input, weights, and outputs
     int *attention_head_out;
     int *we1;
     int *we2;
@@ -309,14 +318,16 @@ static void CPU_profile() {
     printf("\nSTARTing CPU 12 Attention Heads Computation...\n");
 
     total_exe_cycle = 0;
+    // Run attention heads
     for (int i = 0; i < 12; i++) {
+        // Get time for each head
         count1 = get_counter();
         CPU_EdgeBert_attention_profile();
         count2 = get_counter();
         exe_cycle = count2 - count1;
         printf("...Attention Head %d takes %"PRIu64" clock cycles...\n", i, exe_cycle);
 
-        // Fill with dummy data
+        // Fill output with dummy data
         for (int l = 0; l < 128; l++) {
             for (int k = 0; k < 64; k++) {
                 attention_heads_cpu[l * 768 + i * 64 + k] = l * 64 + k;
@@ -329,6 +340,7 @@ static void CPU_profile() {
     printf("###(%"PRIu64" clock cycles)###\n", total_exe_cycle);
     printf("\nSTARTing CPU 12 Attention Heads Processing...\n");
 
+    // Initialize weights for processing
     int *we_heads_cpu;
     we_heads_cpu = aligned_malloc(768 * 768 * sizeof(int));
     int *attention_head_out_cpu;
@@ -1419,15 +1431,12 @@ int main(int argc, char * argv[]) {
 
         for (int l = 0; l < 128; l++) {
             for (int k = 0; k < 64; k++) {
-                // TODO: Look at mem memory location!
                 attention_heads[l * 768 + i * 64 + k] = mem[mask_buffer_size + 2 * input_buffer_size + aux_buffer_size + l * 64 + k];
             }
         }
 
         // Keep track of number of cycles
         total_exe_cycle = total_exe_cycle + exe_cycle;
-
-        // TODO: Add high way exit
     }
     printf("FINISHing EdgeBERT 12 Attention Heads Computation...\n");
     printf("###(%"PRIu64" clock cycles)###\n", total_exe_cycle);
