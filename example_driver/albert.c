@@ -640,8 +640,11 @@ static void general_mat_mul(
     unsigned N0_tile;
     unsigned N1_tile;
 
+    // Try to get as many columns
     N1_tile = input_buffer_size / M_mat;
     N0_tile = input_buffer_size / (M_mat + N1_tile);
+    // Assume that at least one row and output can fit
+    assert(N0_tile != 0);
 
     EdgeBert_init(dev, plic_dev, mem);
     int count = 0;
@@ -649,19 +652,26 @@ static void general_mat_mul(
     token_t *left;
     token_t *right;
     token_t *output;
+
     left = aligned_malloc(N0_tile * M_mat);
     right = aligned_malloc(M_mat * N1_tile);
     output = aligned_malloc(N0 * N1);
+
+    // Tranpose for easier access
     CPU_transpose(D_mat2, M_mat, N1);
 
     int row = 0, col = 0;
     while (row < N0) {
+        // Get left matrix
         unsigned N0_mat = min(N0_tile, N0 - row);
         memcpy(left, D_mat1 + M_mat * row, N0_mat * M_mat * sizeof(token_t));
         while (col < N1) {
+            // Get right matrix
             unsigned N1_mat = min(N1_tile, N1 - col);
             memcpy(right, D_mat + M_mat * col, N1_mat * M_mat * sizeof(token_t));
             CPU_transpose(right, N1_mat, M_mat);
+
+            // Multiply
             EdgeBert_mat_mul(dev, plic_dev, N0_mat, N1_mat, M_mat, is_relu, mem, mask_mat, left, right, softmax);
 
             // Copy over data into relu_output
@@ -671,6 +681,7 @@ static void general_mat_mul(
                 }
             }
             col += N1_mat;
+            count++;
         }
         row += N0_mat;
     }
