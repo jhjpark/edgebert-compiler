@@ -15,7 +15,7 @@
 
 // Platform-Level Interrupt Controller (PLIC) (base address)
 #define PLIC_ADDR 0x6c000000
-#define PLIC_IP_OFFSET 0x1000 // Interrupt Pending
+#define PLIC_IP_OFFSET 0x1000       // Interrupt Pending
 #define PLIC_INTACK_OFFSET 0x200004 // Interrupt Acknowledge
 #define EDGEBERT_IRQ 5
 
@@ -96,7 +96,7 @@ static inline uint64_t get_counter() {
 
 
 // CPU functions
-// Transpose a matrix of chars at array with original size mxn (in-place)
+// Transpose a matrix of chars at array with original size m x n (in-place)
 void CPU_transpose(token_t *array, int m, int n) {
     token_t new_array[m * n];
     for (int i = 0; i < m; i++) {
@@ -117,7 +117,7 @@ void CPU_transpose(token_t *array, int m, int n) {
 }
 
 // Transpose for integer
-void CPU_transpose_int (int *array, int m, int n) {
+void CPU_transpose_int(int *array, int m, int n) {
     int new_array[m * n];
     for (int i = 0; i < m; i++) {
         for (int j = 0; j < n; j++) {
@@ -234,9 +234,6 @@ static void CPU_EdgeBert_attention_profile() {
     CPU_multiply(output1, output2, N0, M_mat, N1, output4);
 
     // Softmax?
-    for (int i = 0; i < 128; i++) {
-        CPU_softmax(output4, 128);
-    }
 
     // Attention Span Mask?
 
@@ -350,6 +347,10 @@ static void CPU_profile() {
     for (int i = 0; i < 768 * 768; i++) {
         we_heads_cpu[i] = -1;
     }
+
+    int N0;
+    int N1;
+    int M_mat;
     N0 = 128; M_mat = 768; N1 = 768;
     CPU_multiply(attention_heads_cpu, we_heads_cpu, N0, M_mat, N1, attention_head_out_cpu);
     count2 = get_counter();
@@ -373,6 +374,18 @@ static void CPU_profile() {
 
 
 // Accelerator functions
+static int wait(struct esp_device *plic_dev, int num_interrupts) {
+    // printf("......waiting for interrupt #%i\n", num_interrupts);
+    // iointerrupt();
+    while((ioread32(plic_dev, PLIC_IP_OFFSET) & 0x40) == 0);
+    iowrite32(plic_dev, PLIC_INTACK_OFFSET, EDGEBERT_IRQ + 1);
+    iowrite32(plic_dev, 0x2000, 0x40);
+    iowrite32(plic_dev, 0x18, 0x2);
+    ioread32(plic_dev, PLIC_INTACK_OFFSET);
+    // printf("......receiving for interrupt #%i\n", num_interrupts);
+    return num_interrupts + 1;
+}
+
 // Read for mask (decoder 0 and 1) and aux
 static int EdgeBert_init(struct esp_device *dev, struct esp_device *plic_dev, token_t *mem) {
     // TODO: Our reset hack
@@ -400,6 +413,7 @@ static int EdgeBert_init(struct esp_device *dev, struct esp_device *plic_dev, to
     mask_wr_base = ((unsigned) mem) + mask_buffer_size + 3 * input_buffer_size + aux_buffer_size;
 
     data = 0;
+    // Master mask read (load from outside and store in accelerator MASK scratchpad) for decoder 0
     // Store base output of computations
     data += base_output;
     iowrite32(dev, 0x48, data);
@@ -412,84 +426,51 @@ static int EdgeBert_init(struct esp_device *dev, struct esp_device *plic_dev, to
     // Use 8-bit MAC
     data = 0;
     iowrite32(dev, 0x60, data);
-
     // Set num words to read for Input/Mask AXI
     data = 0;
     data += (M - 1);
     iowrite32(dev, 0x40, data);
-
     // Set mask read address
     data = mask_rd_base;
     iowrite32(dev, 0x28, data);
-
     // Set mask write address
     data = mask_wr_base;
     iowrite32(dev, 0x2C, data);
-
     // Set input write address
     data = input_wr_base;
     iowrite32(dev, 0x34, data);
-
     // Select decoder 0
     data = 0x0;
     iowrite32(dev, 0x08, data);
     // Start master mask read
     data = 0x01;
     iowrite32(dev, 0x04, data);
-
     // Wait for interrupt
-    // printf("......waiting for 1st interrupt\n");
-    // iointerrupt();
-    while((ioread32(plic_dev, PLIC_IP_OFFSET) & 0x40) == 0);
-    iowrite32(plic_dev, PLIC_INTACK_OFFSET, EDGEBERT_IRQ + 1);
-    iowrite32(plic_dev, 0x2000, 0x40);
-    iowrite32(plic_dev, 0x18, 0x2);
-    ioread32(plic_dev, PLIC_INTACK_OFFSET);
-    // printf("......receiving the 1st interrupt\n");
-    num_interrupts++;
+    num_interrupts = wait(plic_dev, num_interrupts);
 
+    // Master mask read (load from outside and store in accelerator MASK scratchpad) for decoder 1
     // Select decoder 1
     data = 0x1;
     iowrite32(dev, 0x08, data);
-
     // Start master mask read
     data = 0x01;
     iowrite32(dev,0x04, data);
-
     // Wait for interrupt
-    // printf("......waiting for 2nd interrupt\n");
-    // iointerrupt();
-    while((ioread32(plic_dev, PLIC_IP_OFFSET) & 0x40) == 0);
-    iowrite32(plic_dev, PLIC_INTACK_OFFSET, EDGEBERT_IRQ + 1);
-    iowrite32(plic_dev, 0x2000, 0x40);
-    iowrite32(plic_dev, 0x18, 0x2);
-    ioread32(plic_dev, PLIC_INTACK_OFFSET);
-    // printf("......receiving the 2nd interrupt\n");
-    num_interrupts++;
+    num_interrupts = wait(plic_dev, num_interrupts);
 
+    // Start master aux read (load from outside and store in accelerator AUX scratchpad)
     // Set num words to read/write Aux AXI
     data = 0;
     data += (M - 1);
     iowrite32(dev, 0x44, data);
-
     // Set aux read base
     data = aux_rd_base;
     iowrite32(dev, 0x38, data);
-
-    // Start aux master read
+    // Start master aux read
     data = 0x05;
     iowrite32(dev, 0x04, data);
-
     // Wait for interrupt
-    // printf("......waiting for the 3rd interrupt\n");
-    // iointerrupt();
-    while((ioread32(plic_dev, PLIC_IP_OFFSET) & 0x40) == 0);
-    iowrite32(plic_dev, PLIC_INTACK_OFFSET, EDGEBERT_IRQ + 1);
-    iowrite32(plic_dev, 0x2000, 0x40);
-    iowrite32(plic_dev, 0x18, 0x2);
-    ioread32(plic_dev, PLIC_INTACK_OFFSET);
-    // printf("......receiving the 3rd interrupt\n");
-    num_interrupts++;
+    num_interrupts = wait(plic_dev, num_interrupts);
 
     printf("...FINISHing base addr setting for EdgeBert...\n");
 }
@@ -519,8 +500,9 @@ static int EdgeBert_mat_mul(
     memcpy(mem, mask_mat, mask_buffer_size * sizeof(token_t));
     memcpy(mem + mask_buffer_size, D_mat1, N0 * M_mat * sizeof(token_t));
     memcpy(mem + mask_buffer_size + input_buffer_size, D_mat2, M_mat * N1 * sizeof(token_t));
-    //memcpy(mem + mask_buffer_size + 2 * input_buffer_size, aux_mat, aux_buffer_size * sizeof(token_t));
+    // memcpy(mem + mask_buffer_size + 2 * input_buffer_size, aux_mat, aux_buffer_size * sizeof(token_t));
 
+    // Load in matrices to accelerator
     // Set post-processing configuration
     data = 0;
     data += is_relu;
@@ -529,109 +511,67 @@ static int EdgeBert_mat_mul(
     data += adf_accum_bias << 16;
     data += accum_right_shift << 20;
     iowrite32(dev, 0x0C, data);
-
-    // Load in matrices to accelerator
+    
+    // Load in data to decoder 0
     // Start with D_mat1 in decoder 0
     data = 0x0;
     iowrite32(dev, 0x4C, data);
     iowrite32(dev, 0x08, data);
-
     // Set base read address
     data = input_rd1_base;
     iowrite32(dev, 0x30, data);
-
     // Start master input read
     data = 0x03;
     iowrite32(dev, 0x04, data);
-
     // Wait for interrupt
-    // printf("......waiting for 1st interrupt\n");
-    // iointerrupt();
-    while((ioread32(plic_dev, PLIC_IP_OFFSET) & 0x40) == 0);
-    iowrite32(plic_dev, PLIC_INTACK_OFFSET, EDGEBERT_IRQ + 1);
-    iowrite32(plic_dev, 0x2000, 0x40);
-    iowrite32(plic_dev, 0x18, 0x2);
-    ioread32(plic_dev, PLIC_INTACK_OFFSET);
-    // printf("......receiving the 1st interrupt\n");
-    num_interrupts++;
+    num_interrupts = wait(plic_dev, num_interrupts);
 
+    // Load in data to decoder 1
     // D_mat2 in decoder 1
     // Switch decoder
     data = 0x1;
     iowrite32(dev, 0x08, data);
-
     // Set base read address
     data = input_rd2_base;
     iowrite32(dev, 0x30, data);
-
     // Start master input read
     data = 0x03;
     iowrite32(dev, 0x04, data);
+    num_interrupts = wait(plic_dev, num_interrupts);
 
-    // Wait for interrupt
-    // printf("......waiting for 2nd interrupt\n");
-    // iointerrupt();
-    while((ioread32(plic_dev, PLIC_IP_OFFSET) & 0x40) == 0);
-    iowrite32(plic_dev, PLIC_INTACK_OFFSET, EDGEBERT_IRQ + 1);
-    iowrite32(plic_dev, 0x2000, 0x40);
-    iowrite32(plic_dev, 0x18, 0x2);
-    ioread32(plic_dev, PLIC_INTACK_OFFSET);
-    // printf("......receiving the 2nd interrupt\n");
-    num_interrupts++;
-
+    // Do matrix multiplication
     // Start matrix size configurations
     data = 0x0;
     data += N0;
     data += N1 << 10;
     data += M_mat << 20;
     iowrite32(dev, 0x10, data);
-
     // Set base input of first and second matrix
     data = 0;
     data += base_input0;
     data += base_input1 << 16;
     iowrite32(dev, 0x14, data);
-
     // Set offset
     data = 0;
     iowrite32(dev, 0x18, data);
-
     // Start matrix multiplication
     data = 0x07;
     iowrite32(dev, 0x04, data);
-
     // Wait for interrupt
-    // printf("......waiting for 3rd interrupt\n");
-    // iointerrupt();
-    while((ioread32(plic_dev, PLIC_IP_OFFSET) & 0x40) == 0);
-    iowrite32(plic_dev, PLIC_INTACK_OFFSET, EDGEBERT_IRQ + 1);
-    iowrite32(plic_dev, 0x2000, 0x40);
-    iowrite32(plic_dev, 0x18, 0x2);
-    ioread32(plic_dev, PLIC_INTACK_OFFSET);
-    // printf("......receiving the 3rd interrupt\n");
-    num_interrupts++;
+    num_interrupts = wait(plic_dev, num_interrupts);
 
     // Write data outside
     if (softmax == 0) {
         // Set use_axi to 1
         data = 0x1;
         iowrite32(dev, 0x4C, data);
-
         // Start input master write
         data = 0x04;
         iowrite32(dev, 0x04, data);
-
         // Wait for interrupt
-        // printf("......waiting for 4th interrupt\n");
-        // iointerrupt();
-        while((ioread32(plic_dev, PLIC_IP_OFFSET) & 0x40) == 0);
-        iowrite32(plic_dev, PLIC_INTACK_OFFSET, EDGEBERT_IRQ + 1);
-        iowrite32(plic_dev, 0x2000, 0x40);
-        iowrite32(plic_dev, 0x18, 0x2);
-        ioread32(plic_dev, PLIC_INTACK_OFFSET);
-        // printf("......receiving the 4th interrupt\n");
-        num_interrupts++;
+        num_interrupts = wait(plic_dev, num_interrupts);
     }
+
     printf("...FINISHing Matmul in EdgeBert...\n");
     return num_interrupts;
 }
