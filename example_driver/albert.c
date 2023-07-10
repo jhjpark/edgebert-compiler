@@ -823,7 +823,7 @@ static int EdgeBert_atten_softmax(
 }
 
 static void EdgeBert_highway_layer() {
-    
+
 }
 
 // Attention head
@@ -1005,10 +1005,6 @@ static void EdgeBert_element_add_layer_norm(
     unsigned data = 0;
     int num_interrupts;
 
-    uint64_t count1;
-    uint64_t count2;
-    uint64_t exe_cycle;
-
     // Copy over data into the CPU
     unsigned input_rd1_base = ((unsigned) mem) + mask_buffer_size;
     unsigned input_rd2_base = ((unsigned) mem) + mask_buffer_size + input_buffer_size;
@@ -1018,14 +1014,12 @@ static void EdgeBert_element_add_layer_norm(
     // Use SFU
     data = 0x1;
     iowrite32(dev, 0x50, data);
-
     // Set reset_mode to 0b100000'000000
     data = 0x800;
     iowrite32(dev, 0x58, data);
     // Set mode_config to ElemAdd
     data = 0x04;
     iowrite32(dev, 0x54, data);
-
     // Set activation config
     data = 0;
     data += num_vector;
@@ -1040,84 +1034,48 @@ static void EdgeBert_element_add_layer_norm(
     iowrite32(dev, 0x4C, data);
     // Set to decoder 0
     iowrite32(dev, 0x08, data);
-
     // Set act/weight data address
     data = input_rd1_base;
     iowrite32(dev, 0x30, data);
-
     // Start master input read
     data = 0x03;
     iowrite32(dev, 0x04, data);
-
     // Wait for interrupt
-    // printf("......waiting for 1st interrupt\n");
-    // iointerrupt();
-    while((ioread32(plic_dev, PLIC_IP_OFFSET) & 0x40) == 0);
-    iowrite32(plic_dev, PLIC_INTACK_OFFSET, EDGEBERT_IRQ + 1);
-    iowrite32(plic_dev, 0x2000, 0x40);
-    iowrite32(plic_dev, 0x18, 0x2);
-    ioread32(plic_dev, PLIC_INTACK_OFFSET);
-    // printf("......receiving the 1st interrupt\n");
-    num_interrupts++;
+    num_interrupts = wait(plic_dev, num_interrupts);
 
     // Load in second matrix
     // Set to decoder 1
     data = 0x1;
     iowrite32(dev, 0x08, data);
-
     // Set read address
     data = input_rd2_base;
     iowrite32(dev, 0x30, data);
-
     // Start master input read
     data = 0x03;
     iowrite32(dev, 0x04, data);
-
     // Wait for interrupt
-    // printf("......waiting for 2nd interrupt\n");
-    // iointerrupt();
-    while((ioread32(plic_dev, PLIC_IP_OFFSET) & 0x40) == 0);
-    iowrite32(plic_dev, PLIC_INTACK_OFFSET, EDGEBERT_IRQ + 1);
-    iowrite32(plic_dev, 0x2000, 0x40);
-    iowrite32(plic_dev, 0x18, 0x2);
-    ioread32(plic_dev, PLIC_INTACK_OFFSET);
-    // printf("......receiving the 2nd interrupt\n");
-    num_interrupts++;
+    num_interrupts = wait(plic_dev, num_interrupts);
 
+    // Perform element-wise addition on D_mat1 + D_mat2
     // Set matrix config
     data = 0x0;
     data += N0;
     data += N1 << 10;
     data += M_mat << 20;
     iowrite32(dev, 0x10, data);
-
     // Set base input
     data = 0;
     data += base_input0;
     data += base_input1 << 16;
     iowrite32(dev, 0x14, data);
-
     // Set offset
     data = 0;
     iowrite32(dev, 0x18, data);
-
     // Start element-wise addition
     data = 0xA;
     iowrite32(dev, 0x04, data);
-
     // Wait for interrupt
-    count1 = get_counter();
-    printf("......WAIT for EADD interrupt\n");
-    // iointerrupt();
-    while((ioread32(plic_dev, PLIC_IP_OFFSET) & 0x40) == 0);
-    iowrite32(plic_dev, PLIC_INTACK_OFFSET, EDGEBERT_IRQ + 1);
-    iowrite32(plic_dev, 0x2000, 0x40);
-    iowrite32(plic_dev, 0x18, 0x2);
-    ioread32(plic_dev, PLIC_INTACK_OFFSET);
-    num_interrupts++;
-    count2 = get_counter();
-    exe_cycle = count2 - count1;
-    printf("......GOT EADD interrupt, and it takes %"PRIu64" clock cycles...\n", exe_cycle);
+    num_interrupts = wait(plic_dev, num_interrupts);
 
     // Layer norm
     // Set to decoder 0
@@ -1133,7 +1091,7 @@ static void EdgeBert_element_add_layer_norm(
     data = 0x1;
     iowrite32(dev, 0x54, data);
 
-    // Set lyear norm configs
+    // Set layer norm configs
     data = 0;
     data += base_attn_span;
     data += base_gamma << 7;
@@ -1142,7 +1100,6 @@ static void EdgeBert_element_add_layer_norm(
     data += adpbias_gamma << 26;
     data += adpbias_beta << 29;
     iowrite32(dev, 0x1C, data);
-
     data = 0;
     data += num_vector;
     data += num_timestep << 8;
@@ -1150,50 +1107,29 @@ static void EdgeBert_element_add_layer_norm(
     data += adpbias_act2 << 20;
     data += adpbias_act3 << 24;
     iowrite32(dev, 0x20, data);
-
     // Set base input
     data = 0;
     data += base_input0;
     data += base_input1 << 16;
     iowrite32(dev, 0x14, data);
+    // Set offset
     data = 0;
     iowrite32(dev, 0x18, data);
-
     // Start layer norm
     data = 0x8;
     iowrite32(dev, 0x04, data);
+    // Wait for interrupt
+    num_interrupts = wait(plic_dev, num_interrupts);
 
-    count1 = get_counter();
-    printf("wait for LayerNorm interrupt\n");
-    // iointerrupt();
-    while((ioread32(plic_dev, PLIC_IP_OFFSET) & 0x40) == 0);
-    iowrite32(plic_dev, PLIC_INTACK_OFFSET, EDGEBERT_IRQ + 1);
-    iowrite32(plic_dev, 0x2000, 0x40);
-    iowrite32(plic_dev, 0x18, 0x2);
-    ioread32(plic_dev, PLIC_INTACK_OFFSET);
-    num_interrupts++;
-    count2 = get_counter();
-    exe_cycle = count2 - count1;
-    printf("......got the LayerNorm interrupt, and it takes %"PRIu64" clock cycles...\n", exe_cycle);
-
+    // Write output to outside
     // Set up write to outside
     data = 0x1;
     iowrite32(dev, 0x4C, data);
-
     // Start master input write
     data = 0x04;
     iowrite32(dev, 0x04, data);
-
     // Wait for interrupt
-    // printf("......waiting for 4th interrupt\n");
-    // iointerrupt();
-    while((ioread32(plic_dev, PLIC_IP_OFFSET) & 0x40) == 0);
-    iowrite32(plic_dev, PLIC_INTACK_OFFSET, EDGEBERT_IRQ + 1);
-    iowrite32(plic_dev, 0x2000, 0x40);
-    iowrite32(plic_dev, 0x18, 0x2);
-    ioread32(plic_dev, PLIC_INTACK_OFFSET);
-    // printf("......receiving the 4th interrupt\n");
-    num_interrupts++;
+    num_interrupts = wait(plic_dev, num_interrupts);
 }
 
 // Feed forward
