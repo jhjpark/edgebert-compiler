@@ -595,12 +595,14 @@ static void general_mat_mul(
     // Try to get as many columns
     N1_tile = input_buffer_size / M_mat;
     N0_tile = input_buffer_size / (M_mat + N1_tile);
+
     // Assume that at least one row and output can fit
     assert(N0_tile != 0);
 
+    // NOTE: Is this necessary? What does this do?
     EdgeBert_init(dev, plic_dev, mem);
-    int count = 0;
 
+    // Allocate memory for matrices
     token_t *left;
     token_t *right;
     token_t *output;
@@ -612,6 +614,7 @@ static void general_mat_mul(
     // Tranpose for easier access
     CPU_transpose(D_mat2, M_mat, N1);
 
+    int count = 0;
     int row = 0, col = 0;
     while (row < N0) {
         // Get left matrix
@@ -651,6 +654,7 @@ static int EdgeBert_atten_softmax(
     unsigned data = 0;
     int num_interrupts;
 
+    // Calculate softmax
     // Set use_gb and reset_mode
     // Choose decoder 0
     data = 0x0;
@@ -664,7 +668,6 @@ static int EdgeBert_atten_softmax(
     // Set mode to softmax
     data = 0x02;
     iowrite32(dev, 0x54, data);
-
     // Configure parameters
     data = 0;
     data += base_attn_span;
@@ -674,7 +677,6 @@ static int EdgeBert_atten_softmax(
     data += adpbias_gamma << 26;
     data += adpbias_beta << 29;
     iowrite32(dev, 0x1C, data);
-
     data = 0;
     data += num_vector;
     data += num_timestep << 8;
@@ -682,58 +684,38 @@ static int EdgeBert_atten_softmax(
     data += adpbias_act2 << 20;
     data += adpbias_act3 << 24;
     iowrite32(dev, 0x20, data);
-
     // Configure matrix size
     data = 0x0;
     data += N0;
     data += N1 << 10;
     data += M_mat << 20;
     iowrite32(dev, 0x10, data);
-
     // Set base of matrix
     data = 0;
     data += base_input0;
     data += base_input1 << 16;
     iowrite32(dev, 0x14, data);
+    // Set offset
     data = 0;
     iowrite32(dev, 0x18, data);
-
     // Set to decoder 0
     data = 0x0;
     iowrite32(dev, 0x08, data);
     // Start softmax
     data = 0x9;
     iowrite32(dev, 0x04, data);
-
     // Wait for interrupt
-    // printf("...waiting for 1st interrupt\n");
-    // iointerrupt();
-    while((ioread32(plic_dev, PLIC_IP_OFFSET) & 0x40) == 0);
-    iowrite32(plic_dev, PLIC_INTACK_OFFSET, EDGEBERT_IRQ + 1);
-    iowrite32(plic_dev, 0x2000, 0x40);
-    iowrite32(plic_dev, 0x18, 0x2);
-    ioread32(plic_dev, PLIC_INTACK_OFFSET);
-    // printf("...receiving the 1st interrupt\n");
-    num_interrupts++;
+    num_interrupts = wait(plic_dev, num_interrupts);
 
+    // Master input write (load from accelerator DATA scratchpad and store outside)
     // Read data to store outside
     data = 0x1;
     iowrite32(dev, 0x4C, data);
-
     // Start input master write
     data = 0x04;
     iowrite32(dev, 0x04, data);
-
     // Wait for interrupt
-    // printf("......waiting for 4th interrupt\n");
-    // iointerrupt();
-    while((ioread32(plic_dev, PLIC_IP_OFFSET) & 0x40) == 0);
-    iowrite32(plic_dev, PLIC_INTACK_OFFSET, EDGEBERT_IRQ + 1);
-    iowrite32(plic_dev, 0x2000, 0x40);
-    iowrite32(plic_dev, 0x18, 0x2);
-    ioread32(plic_dev, PLIC_INTACK_OFFSET);
-    // printf("......receiving the 4th interrupt\n");
-    num_interrupts++;
+    num_interrupts = wait(plic_dev, num_interrupts);
 
     printf("FINISHing SoftAttenM in EdgeBert...\n");
     return num_interrupts;
