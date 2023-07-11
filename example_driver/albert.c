@@ -94,6 +94,7 @@ static inline uint64_t get_counter() {
 
 
 // CPU functions
+// Helper functions
 // Transpose a matrix of chars at array with original size m x n (in-place)
 void CPU_transpose(token_t *array, int m, int n) {
     token_t new_array[m * n];
@@ -229,40 +230,44 @@ token_t *CPU_encode_matrix(token_t *array, int m, int n, token_t *mask) {
             }
         }
     }
-
     return out;
 }
 
+// Transformer profiling
 // Profile CPU attention head
-static void CPU_EdgeBert_attention_profile() {
+static void CPU_EdgeBert_attention(
+    int input_m,
+    int input_n,
+    int output_n,
+    int he_layer_1,
+    int he_layer_2
+) {
+    printf("STARTing Attention Head in CPU...\n");
     // Length of 128 tokens, each token has 768 entries
     int *input_ids;
-
     // Query, key, and value matrices (768 x 64)
     int *we_query;
     int *we_key;
     int *we_val;
-
     // Output of multiplication (128 x 64)
     int *output1;
     int *output2;
     int *output3;
 
     // Allocate space for matrices
-    input_ids = aligned_malloc(128 * 768 * sizeof(int));
-    we_query = aligned_malloc(768 * 64 * sizeof(int));
-    we_key = aligned_malloc(768 * 64 * sizeof(int));
-    we_val = aligned_malloc(768 * 64 * sizeof(int));
-    output1 = aligned_malloc(128 * 64 * sizeof(int));
-    output2 = aligned_malloc(128 * 64 * sizeof(int));
-    output3 = aligned_malloc(128 * 64 * sizeof(int));
+    input_ids = aligned_malloc(input_m * input_n * sizeof(int));
+    we_query = aligned_malloc(input_n * output_n * sizeof(int));
+    we_key = aligned_malloc(input_n * output_n * sizeof(int));
+    we_val = aligned_malloc(input_n * output_n * sizeof(int));
+    output1 = aligned_malloc(input_m * output_n * sizeof(int));
+    output2 = aligned_malloc(input_m * output_n * sizeof(int));
+    output3 = aligned_malloc(input_m * output_n * sizeof(int));
 
     // Fill with dummy data
-    for (int i = 0; i < 128 * 768; i++) {
+    for (int i = 0; i < input_m * input_n; i++) {
         input_ids[i] = 12;
     }
-
-    for (int i = 0; i < 768 * 64; i++) {
+    for (int i = 0; i < input_n * output_n; i++) {
         we_query[i] = 24;
         we_key[i] = -5;
         we_val[i] = 126;
@@ -272,7 +277,7 @@ static void CPU_EdgeBert_attention_profile() {
     int N0;
     int N1;
     int M_mat;
-    N0 = 128; M_mat = 768; N1 = 64;
+    N0 = input_m; M_mat = input_n; N1 = output_n;
 
     // Query multiplication
     CPU_multiply(input_ids, we_query, N0, M_mat, N1, output1);
@@ -280,13 +285,13 @@ static void CPU_EdgeBert_attention_profile() {
     CPU_multiply(input_ids, we_key, N0, M_mat, N1, output2);
     // Value multiplication
     CPU_multiply(input_ids, we_val, N0, M_mat, N1, output3);
-    // Transpose key ooutput
+    // Transpose key output
     CPU_transpose_int(output2, N0, N1);
 
     // Query output (128 x 64) multiplied by transpose of key output (64 x 128)
-    N0 = 128; M_mat = 64; N1 = 128;
+    N0 = input_m; M_mat = output_n; N1 = input_m;
     int *output4;
-    output4 = aligned_malloc(128 * 128 * sizeof(int));
+    output4 = aligned_malloc(input_m * input_m * sizeof(int));
     CPU_multiply(output1, output2, N0, M_mat, N1, output4);
 
     // Softmax?
@@ -294,9 +299,9 @@ static void CPU_EdgeBert_attention_profile() {
     // Attention Span Mask?
 
     // Multiply value output
-    N0 = 128; M_mat = 128; N1 = 64;
+    N0 = input_m; M_mat = input_m; N1 = output_n;
     int *output5;
-    output5 = aligned_malloc(128 * 64 * sizeof(int));
+    output5 = aligned_malloc(input_m * output_n * sizeof(int));
     CPU_multiply(output4, output3, N0, M_mat, N1, output5);
 
     // Free allocated space
@@ -309,6 +314,48 @@ static void CPU_EdgeBert_attention_profile() {
     aligned_free(output3);
     aligned_free(output4);
     aligned_free(output5);
+    printf("FINISHing Attention Head in CPU...\n");
+}
+
+static void CPU_EdgeBert_attention_heads(
+
+) {
+    uint64_t total_exe_cycle = 0;
+    uint64_t count1;
+    uint64_t count2;
+    uint64_t exe_cycle;
+
+    // CPU Performance
+    printf("\n\n");
+    // Initialize input ids
+    int *attention_heads_cpu;
+    attention_heads_cpu = aligned_malloc(128 * 768 * sizeof(int));
+
+    printf("Transformer Matmul Performance Profiling on Ariane RISC-V CPU\n");
+    printf("\nSTARTing CPU 12 Attention Heads Computation...\n");
+
+    total_exe_cycle = 0;
+    // Run attention heads
+    for (int i = 0; i < 12; i++) {
+        // Get time for each head
+        count1 = get_counter();
+        CPU_EdgeBert_attention_profile();
+        count2 = get_counter();
+        exe_cycle = count2 - count1;
+        printf("...Attention Head %d takes %"PRIu64" clock cycles...\n", i, exe_cycle);
+
+        // Fill output with dummy data
+        for (int l = 0; l < 128; l++) {
+            for (int k = 0; k < 64; k++) {
+                attention_heads_cpu[l * 768 + i * 64 + k] = l * 64 + k;
+            }
+        }
+        total_exe_cycle = total_exe_cycle + exe_cycle;
+    }
+
+    printf("FINISHing CPU 12 Attention Heads Computation...\n");
+    printf("###(%"PRIu64" clock cycles)###\n", total_exe_cycle);
+    printf("\nSTARTing CPU 12 Attention Heads Processing...\n");
 }
 
 // Feed forward neural network after attention heads
@@ -356,42 +403,7 @@ static void CPU_EdgeBert_feed_forward() {
 
 // Profile CPU performance
 static void CPU_profile() {
-    uint64_t total_exe_cycle = 0;
-    uint64_t count1;
-    uint64_t count2;
-    uint64_t exe_cycle;
-
-    // CPU Performance
-    printf("\n\n");
-    // Initialize input ids
-    int *attention_heads_cpu;
-    attention_heads_cpu = aligned_malloc(128 * 768 * sizeof(int));
-
-    printf("Transformer Matmul Performance Profiling on Ariane RISC-V CPU\n");
-    printf("\nSTARTing CPU 12 Attention Heads Computation...\n");
-
-    total_exe_cycle = 0;
-    // Run attention heads
-    for (int i = 0; i < 12; i++) {
-        // Get time for each head
-        count1 = get_counter();
-        CPU_EdgeBert_attention_profile();
-        count2 = get_counter();
-        exe_cycle = count2 - count1;
-        printf("...Attention Head %d takes %"PRIu64" clock cycles...\n", i, exe_cycle);
-
-        // Fill output with dummy data
-        for (int l = 0; l < 128; l++) {
-            for (int k = 0; k < 64; k++) {
-                attention_heads_cpu[l * 768 + i * 64 + k] = l * 64 + k;
-            }
-        }
-        total_exe_cycle = total_exe_cycle + exe_cycle;
-    }
-
-    printf("FINISHing CPU 12 Attention Heads Computation...\n");
-    printf("###(%"PRIu64" clock cycles)###\n", total_exe_cycle);
-    printf("\nSTARTing CPU 12 Attention Heads Processing...\n");
+    
 
     // Initialize weights for processing
     int *we_heads_cpu;
@@ -821,7 +833,42 @@ static int EdgeBert_atten_softmax(
 }
 
 static void EdgeBert_highway_layer() {
+    // Highway exit
+    // Index in to layer outputs
+    token_t *input;
+    memcpy(input, val_mat, N1 * sizeof(token_t));
 
+    // Intialize linear layer and outputs
+    token_t *we_mat_1;
+    token_t *result_mat_1;
+
+    N0 = he_layer_1;
+    M_mat = input_m;
+    N1 = 1;
+
+    we_mat_1 = aligned_malloc(N0 * M_mat);
+    result_mat_1 = aligned_malloc(N0 * N1);
+    memset(we_mat_1, 35, N0 * M_mat * sizeof(token_t));
+
+    // Perform matrix multiplication
+    softmax = 0;
+    general_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, we_mat_1, input, softmax);
+    memcpy(result_mat_1, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
+
+    // Perform classification
+    token_t *we_mat_2;
+    token_t *result_mat_2;
+
+    N0 = he_layer_1;
+    M_mat = he_layer_2;
+    N1 = 1;
+
+    we_mat_2 = aligned_malloc(N0 * M_mat);
+    memset(we_mat_2, -24, N0 * M_mat * sizeof(token_t));
+
+    // Perform matrix multiplication
+    general_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, we_mat_2, result_mat_1, softmax);
+    memcpy(result_mat_2, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
 }
 
 // Attention head
@@ -940,43 +987,6 @@ static void EdgeBert_attention(
     // EdgeBert_init(dev, plic_dev, mem);
     general_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, query_key_mat, val_mat, softmax);
     memcpy(value_mat, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
-
-    // Highway exit
-    // Index in to layer outputs
-    token_t *input;
-    memcpy(input, val_mat, N1 * sizeof(token_t));
-
-    // Intialize linear layer and outputs
-    token_t *we_mat_1;
-    token_t *result_mat_1;
-
-    N0 = he_layer_1;
-    M_mat = input_m;
-    N1 = 1;
-
-    we_mat_1 = aligned_malloc(N0 * M_mat);
-    result_mat_1 = aligned_malloc(N0 * N1);
-    memset(we_mat_1, 35, N0 * M_mat * sizeof(token_t));
-
-    // Perform matrix multiplication
-    softmax = 0;
-    general_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, we_mat_1, input, softmax);
-    memcpy(result_mat_1, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
-
-    // Perform classification
-    token_t *we_mat_2;
-    token_t *result_mat_2;
-
-    N0 = he_layer_1;
-    M_mat = he_layer_2;
-    N1 = 1;
-
-    we_mat_2 = aligned_malloc(N0 * M_mat);
-    memset(we_mat_2, -24, N0 * M_mat * sizeof(token_t));
-
-    // Perform matrix multiplication
-    general_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, we_mat_2, result_mat_1, softmax);
-    memcpy(result_mat_2, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
 
     // Free memory
     aligned_free(input_ids);
