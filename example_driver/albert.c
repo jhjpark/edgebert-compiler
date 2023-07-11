@@ -34,8 +34,6 @@ static unsigned DMA_WORD_PER_BEAT(unsigned _st) {
 // Config
 // Constants
 static unsigned mem_size;
-
-// QUESTION: What are M and N?
 const static int N = 16;
 const static int M = N;
 
@@ -1465,8 +1463,8 @@ static void EdgeBert_transformer(
     printf("\nEdgeBERT Transformer Layer DONE...\n");
     printf("Thank you!\n");
 
+    aligned_free(attention_heads);
     aligned_free(attention_out);
-    aligned_free(mem);
 }
 
 // Driver
@@ -1507,6 +1505,15 @@ int main(int argc, char * argv[]) {
     }
 
     // Run transformer on accelerator
-    EdgeBert_transformer();
+    EdgeBert_transformer(
+        dev,
+        plic_dev,
+        mem,
+        12,
+        128,
+        768,
+        64
+    );
+    aligned_free(mem);
     return 0;
 }
