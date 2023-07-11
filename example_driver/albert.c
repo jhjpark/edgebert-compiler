@@ -318,36 +318,44 @@ static void CPU_EdgeBert_attention(
 }
 
 static void CPU_EdgeBert_attention_heads(
-
+    int num_heads,
+    int input_m,
+    int input_n,
+    int output_n,
+    int he_layer_1,
+    int he_layer_2
 ) {
-    uint64_t total_exe_cycle = 0;
-    uint64_t count1;
-    uint64_t count2;
-    uint64_t exe_cycle;
+    printf("STARTing CPU 12 Attention Heads Computation...\n");
 
-    // CPU Performance
-    printf("\n\n");
     // Initialize input ids
     int *attention_heads_cpu;
     attention_heads_cpu = aligned_malloc(128 * 768 * sizeof(int));
 
-    printf("Transformer Matmul Performance Profiling on Ariane RISC-V CPU\n");
-    printf("\nSTARTing CPU 12 Attention Heads Computation...\n");
-
+    uint64_t total_exe_cycle = 0;
+    uint64_t count1;
+    uint64_t count2;
+    uint64_t exe_cycle;
     total_exe_cycle = 0;
+
     // Run attention heads
     for (int i = 0; i < 12; i++) {
         // Get time for each head
         count1 = get_counter();
-        CPU_EdgeBert_attention_profile();
+        CPU_EdgeBert_attention(
+            input_m,
+            input_n,
+            output_n,
+            he_layer_1,
+            he_layer_2
+        );
         count2 = get_counter();
         exe_cycle = count2 - count1;
         printf("...Attention Head %d takes %"PRIu64" clock cycles...\n", i, exe_cycle);
 
         // Fill output with dummy data
-        for (int l = 0; l < 128; l++) {
-            for (int k = 0; k < 64; k++) {
-                attention_heads_cpu[l * 768 + i * 64 + k] = l * 64 + k;
+        for (int l = 0; l < input_m; l++) {
+            for (int k = 0; k < output_n; k++) {
+                attention_heads_cpu[l * output_n * num_heads + i * output_n + k] = l * output_n + k;
             }
         }
         total_exe_cycle = total_exe_cycle + exe_cycle;
@@ -355,29 +363,70 @@ static void CPU_EdgeBert_attention_heads(
 
     printf("FINISHing CPU 12 Attention Heads Computation...\n");
     printf("###(%"PRIu64" clock cycles)###\n", total_exe_cycle);
-    printf("\nSTARTing CPU 12 Attention Heads Processing...\n");
+}
+
+static void CPU_EdgeBert_processing(
+    int head_m,
+    int head_n,
+    int input_n
+) {
+    printf("STARTing CPU 12 Attention Heads Processing...\n");
+    uint64_t count1;
+    uint64_t count2;
+    count1 = get_counter();
+
+    // Initialize weights for processing
+    int *attention_head_cpu;
+    attention_head_cpu = aligned_malloc(head_m * head_n * sizeof(int));
+    int *we_heads_cpu;
+    we_heads_cpu = aligned_malloc(head_n * input_n * sizeof(int));
+
+    // Fill weight matrix with dummy data
+    for (int i = 0; i < head_n * input_n; i++) {
+        we_heads_cpu[i] = -1;
+    }
+
+    int N0;
+    int N1;
+    int M_mat;
+    N0 = head_m; M_mat = head_n; N1 = input_n;
+    CPU_multiply(attention_head_cpu, we_heads_cpu, N0, M_mat, N1, attention_head_out_cpu);
+
+    // Layer normalization?
+
+    count2 = get_counter();
+    printf("FINISHing CPU 12 Attention Heads Processing...\n");
+    printf("###(%"PRIu64" clock cycles)###\n", count2 - count1);
 }
 
 // Feed forward neural network after attention heads
-static void CPU_EdgeBert_feed_forward() {
+static void CPU_EdgeBert_feed_forward(
+    int input_m,
+    int input_n,
+    int we_n,
+    int out_n
+) {
+    printf("STARTing CPU Feed Forward Net Computation...\n");
+    uint64_t count1;
+    uint64_t count2;
+    count1 = get_counter();
+
     // Initialize input, weights, and outputs
     int *attention_head_out;
     int *we1;
     int *we2;
     int *output1;
     int *output2;
-
-    attention_head_out = aligned_malloc(128 * 768 * sizeof(int));
-    we1 = aligned_malloc(768 * 3072 * sizeof(int));
-    we2 = aligned_malloc(3072 * 768 * sizeof(int));
-    output1 = aligned_malloc(128 * 3072 * sizeof(int));
-    output2 = aligned_malloc(128 * 768 * sizeof(int));
+    attention_head_out = aligned_malloc(input_m * input_n * sizeof(int));
+    we1 = aligned_malloc(input_n * we_n * sizeof(int));
+    we2 = aligned_malloc(we_n * out_n * sizeof(int));
+    output1 = aligned_malloc(input_m * we_n * sizeof(int));
+    output2 = aligned_malloc(input_m * out_n * sizeof(int));
 
     // Fill with dummy data
     for (int i = 0; i < 128 * 768; i++) {
         attention_head_out[i] = 38;
     }
-
     for (int i = 0; i < 3072 * 768; i++) {
         we1[i] = 24;
         we2[i] = -5;
@@ -387,7 +436,7 @@ static void CPU_EdgeBert_feed_forward() {
     int N0;
     int N1;
     int M_mat;
-    N0 = 128; M_mat = 768; N1 = 3072;
+    N0 = input_m; M_mat = input_n; N1 = we_n;
 
     // First multiplication with attention output
     CPU_multiply(attention_head_out, we1, N0, M_mat, N1, output1);
@@ -395,48 +444,25 @@ static void CPU_EdgeBert_feed_forward() {
     // Activation function?
 
     // Second multiplication
-    N0 = 128; M_mat = 3072; N1 = 768;
+    N0 = input_m; M_mat = we_n; N1 = out_n;
     CPU_multiply(output1, we2, N0, M_mat, N1, output2);
 
     // Layer normalization?
+
+    count2 = get_counter();
+    printf("FINISHing CPU Feed Forward Net Computation...\n");
+    printf("###(%"PRIu64" clock cycles)###\n", count2 - count1);
 }
 
 // Profile CPU performance
-static void CPU_profile() {
-    
-
-    // Initialize weights for processing
-    int *we_heads_cpu;
-    we_heads_cpu = aligned_malloc(768 * 768 * sizeof(int));
-    int *attention_head_out_cpu;
-    attention_head_out_cpu = aligned_malloc(128 * 768 * sizeof(int));
-
-    count1 = get_counter();
-    for (int i = 0; i < 768 * 768; i++) {
-        we_heads_cpu[i] = -1;
-    }
-
-    int N0;
-    int N1;
-    int M_mat;
-    N0 = 128; M_mat = 768; N1 = 768;
-    CPU_multiply(attention_heads_cpu, we_heads_cpu, N0, M_mat, N1, attention_head_out_cpu);
-    count2 = get_counter();
-
-    // Layer normalization?
-
-    printf("FINISHing CPU 12 Attention Heads Processing...\n");
-    printf("###(%"PRIu64" clock cycles)###\n", count2 - count1);
-    printf("\nSTARTing CPU Feed Forward Net Computation...\n");
-
-    // Feed forward on CPU
-    count1 = get_counter();
+static void CPU_transformer() {
+    printf("\nTransformer Matmul Performance Profiling on Ariane RISC-V CPU BEGIN...\n");
+    CPU_EdgeBert_attention_heads();
+    printf("\n")
+    CPU_EdgeBert_processing();
+    printf("\n");
     CPU_EdgeBert_feed_forward();
-    count2 = get_counter();
-
-    printf("FINISHing CPU Feed Forward Net Computation...\n");
-    printf("###(%"PRIu64" clock cycles)###\n", count2 - count1);
-    printf("\nTransformer Matmul Performance Profiling on Ariane RISC-V CPU DONE...\n");
+    printf("Transformer Matmul Performance Profiling on Ariane RISC-V CPU DONE...\n");
     printf("Thank you!\n");
 }
 
@@ -1006,7 +1032,9 @@ static token_t *EdgeBert_attention_heads(
     int num_heads,
     int input_m,
     int input_n,
-    int output_n
+    int output_n,
+    int he_layer_1,
+    int he_layer_2
 ) {
     printf("STARTing EdgeBERT %i Attention Heads Computation...\n", num_heads);
     uint64_t total_exe_cycle = 0;
