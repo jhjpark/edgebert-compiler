@@ -484,7 +484,7 @@ static int validate_buf(token_t *out, native_t *gold, int out_len) {
     return errors;
 }
 
-// Driver functions
+// Core functions
 // Read for mask (decoder 0 and 1) and aux
 static int EdgeBert_init(struct esp_device *dev, struct esp_device *plic_dev, token_t *mem) {
     // TODO: Our reset hack
@@ -858,7 +858,7 @@ static void EdgeBert_attention(
     // aux_mat = aligned_malloc(4096);
 
     // Initialize weights
-    // init_buf_attention(input_ids1st, input_ids2nd, we_mat1, we_mat2, we_mat3, mask_mat, aux_mat);
+    // init_buf_attention(input_ids, we_mat1, we_mat2, we_mat3, mask_mat, aux_mat);
 
     // Fill with dummy data
     memset(input_ids, 11, input_m * input_n * sizeof(token_t));
@@ -881,7 +881,7 @@ static void EdgeBert_attention(
 
     token_t *query_mat;
     token_t *key_mat;
-    token_t *value_mat;
+    token_t *val_mat;
 
     // Initialize output matrices
     query_mat = aligned_malloc(N0 * N1);
@@ -896,15 +896,15 @@ static void EdgeBert_attention(
 
     // EdgeBert_init(dev, plic_dev, mem);
     // Mutliply IDs by key matrix
-    EdgeBert_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, input_ids1st, we_key, softmax);
+    general_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, input_ids, we_key, softmax);
     // Save result
     memcpy(key_mat, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
 
     // EdgeBert_init(dev, plic_dev, mem);
     // Mutliply IDs by value matrix
-    EdgeBert_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, input_ids1st, we_val, softmax);
+    general_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, input_ids, we_val, softmax);
     // Save result
-    memcpy(vaule_mat, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
+    memcpy(val_mat, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
 
     // Transpose output of key multiplication
     CPU_transpose(key_mat, N0, N1);
@@ -919,7 +919,7 @@ static void EdgeBert_attention(
     // EdgeBert_init(dev, plic_dev, mem);
     // Set softmax parameter to true
     softmax = 1;
-    EdgeBert_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, query_mat, key_mat, softmax);
+    general_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, query_mat, key_mat, softmax);
 
     // Free memory
     aligned_free(query_mat);
@@ -940,13 +940,13 @@ static void EdgeBert_attention(
     N1 = output_n;
 
     // EdgeBert_init(dev, plic_dev, mem);
-    EdgeBert_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, query_key_mat, vaule_mat, softmax);
+    general_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, query_key_mat, val_mat, softmax);
     memcpy(value_mat, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
 
     // Highway exit
     // Index in to layer outputs
     token_t *input;
-    memcpy(input, value_mat, N1 * sizeof(token_t));
+    memcpy(input, val_mat, N1 * sizeof(token_t));
 
     // Intialize linear layer and outputs
     token_t *we_mat_1;
@@ -962,7 +962,7 @@ static void EdgeBert_attention(
 
     // Perform matrix multiplication
     softmax = 0;
-    EdgeBert_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, we_mat_1, vaule_mat_1, softmax);
+    general_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, we_mat_1, input, softmax);
     memcpy(result_mat_1, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
 
     // Perform classification
@@ -977,7 +977,7 @@ static void EdgeBert_attention(
     memset(we_mat_2, -24, N0 * M_mat * sizeof(token_t));
 
     // Perform matrix multiplication
-    EdgeBert_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, we_mat_2, result_mat_1, softmax);
+    general_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, we_mat_2, result_mat_1, softmax);
     memcpy(result_mat_2, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
 
     // Free memory
@@ -989,6 +989,47 @@ static void EdgeBert_attention(
     // aligned_free(aux_mat);
 
     printf("FINISHing Attention Head in EdgeBert...\n");
+}
+
+static token_t *EdgeBert_attention_heads(
+    struct esp_device *dev,
+    struct esp_device *plic_dev,
+    token_t *mem,
+    int num_heads,
+    int input_m,
+    int input_n,
+    int output_n
+) {
+    printf("STARTing EdgeBERT %i Attention Heads Computation...\n", num_heads);
+    uint64_t total_exe_cycle = 0;
+    uint64_t count1;
+    uint64_t count2;
+    uint64_t exe_cycle;
+
+    token_t* attention_heads;
+    attention_heads = aligned_malloc(input_m * input_n);
+
+    for (int i = 0; i < 12; i++) {
+        // Run attention head
+        count1 = get_counter();
+        EdgeBert_attention(&dev, &plic_dev, mem);
+        count2 = get_counter();
+        exe_cycle = count2 - count1;
+        printf("...Attention Head %d takes %"PRIu64" clock cycles...\n", i, exe_cycle);
+
+        for (int l = 0; l < input_m; l++) {
+            for (int k = 0; k < output_n; k++) {
+                attention_heads[l * output_n * num_heads + i * output_n + k] = mem[mask_buffer_size + 2 * input_buffer_size + aux_buffer_size + l * output_n + k];
+            }
+        }
+
+        // Keep track of number of cycles
+        total_exe_cycle = total_exe_cycle + exe_cycle;
+    }
+
+    printf("FINISHing EdgeBERT 12 Attention Heads Computation...\n");
+    printf("###(%"PRIu64" clock cycles)###\n", total_exe_cycle);
+    return attention_heads;
 }
 
 // Apply layer norm
@@ -1011,6 +1052,7 @@ static void EdgeBert_element_add_layer_norm(
     memcpy(mem + mask_buffer_size, D_mat1, N0 * M_mat * sizeof(token_t));
     memcpy(mem + mask_buffer_size + input_buffer_size, D_mat2, M_mat * N1 * sizeof(token_t));
 
+    // Perform element-wise addition on D_mat1 + D_mat2
     // Use SFU
     data = 0x1;
     iowrite32(dev, 0x50, data);
@@ -1056,7 +1098,7 @@ static void EdgeBert_element_add_layer_norm(
     // Wait for interrupt
     num_interrupts = wait(plic_dev, num_interrupts);
 
-    // Perform element-wise addition on D_mat1 + D_mat2
+    // Do the addition
     // Set matrix config
     data = 0x0;
     data += N0;
@@ -1132,206 +1174,18 @@ static void EdgeBert_element_add_layer_norm(
     num_interrupts = wait(plic_dev, num_interrupts);
 }
 
-// Feed forward
-static void EdgeBert_feed_forward(
+static void EdgeBert_processing(
     struct esp_device *dev,
     struct esp_device *plic_dev,
     token_t *mem,
     token_t *attention_out
 ) {
-    int softmax = 0;
-    printf("STARTing EdgeBERT Feed Forward Computation...\n");
-    token_t *mask_mat;
-    mask_mat = aligned_malloc(8192);
-    // memset(mask_mat, 255, 8192 * sizeof(token_t));
-
-    // Initialize weights
-    token_t* we1_mat; // 768 x 3072
-    token_t* we2_mat; // 3072 x 768
-
-    we1_mat = aligned_malloc(768 * 3072);
-    we2_mat = aligned_malloc(768 * 3072);
-
-    // Load dummy data
-    memset(we1_mat, -1, 768 * 3072 * sizeof(token_t));
-    memset(we2_mat, -12, 768 * 3072 * sizeof(token_t));
-
-    // Multiply attention output by weights ((128 x 768) x (768 x 3072) = (128 x 3072))
-    unsigned N0;
-    unsigned N1;
-    unsigned M_mat;
-    unsigned is_relu;
-
-    N0 = 64;
-    M_mat = 768;
-    N1 = 64;
-    is_relu = 1;
-
-    // Split attention output into two
-    token_t *input_1;     // 64 x 768
-    token_t *input_2;     // 768 x 64
-    token_t *relu_output; // 128 x 3072
-
-    input_1 = aligned_malloc(N0 * M_mat);
-    input_2 = aligned_malloc(M_mat * N1);
-    relu_output = aligned_malloc(128 * 3072);
-
-    EdgeBert_init(dev, plic_dev, mem);
-    int count = 0;
-
-    for (int i = 0; i < 2; i++) {
-        // Load in half of attention output
-        memcpy(input_1, attention_out + i * N0 * M_mat, N0 * M_mat * sizeof(token_t));
-
-        for (int j = 0; j < 48; j++) {
-            // TODO: Need to transpose?
-            memcpy(input_2, we1_mat + j * M_mat * N1, M_mat * N1 * sizeof(token_t));
-
-            if (count == 2) {
-                EdgeBert_init(dev, plic_dev, mem);
-                count = 0;
-            }
-            EdgeBert_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, input_1, input_2, softmax);
-            // memcpy(relu_output + N0 * N1 * i * j, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
-
-            // Copy over data into relu_output
-            for (int l = 0; l < N0; l++) {
-                for (int k = 0; k < N1; k++) {
-                    relu_output[(l + i * N0) * 3072 + j * N1 + k] = mem[mask_buffer_size + 2 * input_buffer_size + aux_buffer_size + l * N0 + k];
-                }
-            }
-            count++;
-        }
-    }
-
-    // Multiply relu_out with second weights ((8 x 16) x 3072) x (3072 x (16 x 48))
-    N0 = 16;
-    M_mat = 3072;
-    N1 = 16;
-    is_relu = 0;
-
-    aligned_free(input_1);
-    aligned_free(input_2);
-    token_t *we2_output;
-
-    input_1 = aligned_malloc(N0 * M_mat);
-    input_2 = aligned_malloc(M_mat * N1);
-    we2_output = aligned_malloc(128 * 768);
-
-    // EdgeBert_init(dev, plic_dev, mem);
-    count = 0;
-
-    for (int i = 0; i < 8; i++) {
-        memcpy(input_1, relu_output + i * N0 * M_mat, N0 * M_mat * sizeof(token_t));
-
-        for (int j = 0; j < 48; j++) {
-            memcpy(input_2, we2_mat + j * M_mat * N1, M_mat * N1 * sizeof(token_t));
-
-            if (count == 2) {
-                // EdgeBert_init(dev, plic_dev, mem);
-                count = 0;
-            }
-
-            EdgeBert_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, input_1, input_2, softmax);
-            // memcpy(we2_output + N0 * N1 * i * j, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
-
-            for (int l = 0; l < N0; l++) {
-                for (int k = 0; k < N1; k++) {
-                    we2_output[(l + i * N0) * 768 + j * N1 + k] = mem[mask_buffer_size + 2 * input_buffer_size + aux_buffer_size + l * N0 + k];
-                }
-            }
-            count++;
-        }
-    }
-
-    aligned_free(input_1);
-    aligned_free(input_2);
-
-    N0 = 64;
-    M_mat = 768;
-    N1 = 64;
-
-    // Add attention output
-    token_t* FFN_output;
-    input_1 = aligned_malloc(N0 * M_mat);
-    input_2  = aligned_malloc(M_mat * N1);
-    CPU_transpose(attention_out, 768, 128);
-    FFN_output = aligned_malloc(128*768);
-
-    for (int i = 0; i < 2; i++) {
-        // Add parts of attention output
-        memcpy(input_1, we2_output + i * N0 * M_mat, N0 * M_mat * sizeof(token_t));
-        memcpy(input_2, attention_out + i * N1 * M_mat, N1 * M_mat * sizeof(token_t));
-        EdgeBert_init(dev, plic_dev, mem);
-        EdgeBert_ElementAddLayerNorm(dev, plic_dev, N0, N1, M_mat, mem, input_1, input_2);
-        memcpy(FFN_output + i * N0 * M_mat, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * M_mat * sizeof(token_t));
-    }
-
-    // Free memory
-    aligned_free(input_1);
-    aligned_free(input_2);
-    aligned_free(we2_output);
-    aligned_free(mask_mat);
-    aligned_free(we1_mat);
-    aligned_free(we2_mat);
-    aligned_free(relu_output);
-    printf("FINISHing EdgeBERT Feed Forward Computation...\n");
-}
-
-static void EdgeBert_transformer(
-    struct esp_device *dev,
-    struct esp_device *plic_dev,
-    token_t *mem,
-    token_t *attention_out
-) {
-    int num_interrupts;
-
-    // Start Epochs
-    printf("\n");
-    printf("  #######  ######      ######       ####    #     #    #####   \n");
-    printf("  #        #     #    #      #     #        #     #   #     #  \n");
-    printf("  #        #     #   #        #   #         #     #   #        \n");
-    printf("  #######  ######    #        #   #         #######    #####   \n");
-    printf("  #        #         #        #   #         #     #         #  \n");
-    printf("  #        #          #      #     #        #     #   #     #  \n");
-    printf("  #######  #           ######       ####    #     #    #####   \n");
-    printf("\n");
-    printf("STARTing EdgeBERT 12 Attention Heads Computation...\n");
-
-    // Transformer
-    token_t* attention_heads;
-    attention_heads = aligned_malloc(128 * 768);
-
+    printf("\nSTARTing 12 Attention Heads Processing...\n");
     uint64_t total_exe_cycle = 0;
     uint64_t count1;
     uint64_t count2;
-    double exe_time;
     uint64_t exe_cycle;
 
-    for (int i = 0; i < 12; i++) {
-        // Run attention head
-        count1 = get_counter();
-        EdgeBert_attention(&dev, &plic_dev, mem);
-        count2 = get_counter();
-        exe_time = (count2 - count1) * 50;
-        exe_cycle = (count2 - count1);
-        printf("...Attention Head %d takes %u ns seconds...\n", i, exe_time);
-        printf("...Attention Head %d takes %"PRIu64" clock cycles...\n", i, exe_cycle);
-
-        for (int l = 0; l < 128; l++) {
-            for (int k = 0; k < 64; k++) {
-                attention_heads[l * 768 + i * 64 + k] = mem[mask_buffer_size + 2 * input_buffer_size + aux_buffer_size + l * 64 + k];
-            }
-        }
-
-        // Keep track of number of cycles
-        total_exe_cycle = total_exe_cycle + exe_cycle;
-    }
-    printf("FINISHing EdgeBERT 12 Attention Heads Computation...\n");
-    printf("###(%"PRIu64" clock cycles)###\n", total_exe_cycle);
-
-    // Processing
-    printf("\nSTARTing 12 Attention Heads Processing...\n");
     count1 = get_counter();
     // Multiply conatenated output (128 x 768)
     token_t* we_heads;
@@ -1415,20 +1269,199 @@ static void EdgeBert_transformer(
         EdgeBert_element_add_layer_norm(&dev, &plic_dev, N0, N1, M_mat, mem, input_1, input_2);
         memcpy(attention_out + i * N0 * M_mat, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * M_mat * sizeof(token_t));
     }
-
     count2 = get_counter();
     printf("FINISHing 12 Attention Heads Processing...\n");
     printf("###(%"PRIu64" clock cycles)###\n", count2 - count1);
 
-    // Feed Forward Neural Net
+    return attention_out;
+}
+
+// Feed forward
+static void EdgeBert_feed_forward(
+    struct esp_device *dev,
+    struct esp_device *plic_dev,
+    token_t *mem,
+    token_t *processing_out
+) {
     printf("\nSTARTing EdgeBERT Feed Forward Net Computation...\n");
-    EdgeBert_init(&dev, &plic_dev, mem);
+    uint64_t total_exe_cycle = 0;
+    uint64_t count1;
+    uint64_t count2;
+    uint64_t exe_cycle;
 
     count1 = get_counter();
-    EdgeBert_feed_forward (&dev, &plic_dev, mem, attention_out);
+    EdgeBert_init(&dev, &plic_dev, mem);
+
+    int softmax = 0;
+    token_t *mask_mat;
+    mask_mat = aligned_malloc(8192);
+    memset(mask_mat, 255, 8192 * sizeof(token_t));
+
+    // Initialize weights
+    token_t* we_mat1; // 768 x 3072
+    token_t* we_mat2; // 3072 x 768
+
+    we_mat1 = aligned_malloc(768 * 3072);
+    we_mat2 = aligned_malloc(768 * 3072);
+
+    // init_buf_ffn(we_mat1, we_mat2);
+    // Load dummy data
+    memset(we_mat1, -1, 768 * 3072 * sizeof(token_t));
+    memset(we_mat2, -12, 768 * 3072 * sizeof(token_t));
+
+    // Multiply attention output by weights ((128 x 768) x (768 x 3072) = (128 x 3072))
+    unsigned N0;
+    unsigned N1;
+    unsigned M_mat;
+    unsigned is_relu;
+
+    N0 = 64;
+    M_mat = 768;
+    N1 = 64;
+    is_relu = 1;
+
+    // Split attention output into two
+    token_t *input_1;     // 64 x 768
+    token_t *input_2;     // 768 x 64
+    token_t *relu_output; // 128 x 3072
+
+    input_1 = aligned_malloc(N0 * M_mat);
+    input_2 = aligned_malloc(M_mat * N1);
+    relu_output = aligned_malloc(128 * 3072);
+
+    EdgeBert_init(dev, plic_dev, mem);
+    int count = 0;
+
+    for (int i = 0; i < 2; i++) {
+        // Load in half of attention output
+        memcpy(input_1, processing_out + i * N0 * M_mat, N0 * M_mat * sizeof(token_t));
+
+        for (int j = 0; j < 48; j++) {
+            // TODO: Need to transpose?
+            memcpy(input_2, we1_mat + j * M_mat * N1, M_mat * N1 * sizeof(token_t));
+
+            if (count == 2) {
+                EdgeBert_init(dev, plic_dev, mem);
+                count = 0;
+            }
+            EdgeBert_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, input_1, input_2, softmax);
+            // memcpy(relu_output + N0 * N1 * i * j, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
+
+            // Copy over data into relu_output
+            for (int l = 0; l < N0; l++) {
+                for (int k = 0; k < N1; k++) {
+                    relu_output[(l + i * N0) * 3072 + j * N1 + k] = mem[mask_buffer_size + 2 * input_buffer_size + aux_buffer_size + l * N0 + k];
+                }
+            }
+            count++;
+        }
+    }
+
+    // Multiply relu_out with second weights ((8 x 16) x 3072) x (3072 x (16 x 48))
+    N0 = 16;
+    M_mat = 3072;
+    N1 = 16;
+    is_relu = 0;
+
+    aligned_free(input_1);
+    aligned_free(input_2);
+    token_t *we2_output;
+
+    input_1 = aligned_malloc(N0 * M_mat);
+    input_2 = aligned_malloc(M_mat * N1);
+    we2_output = aligned_malloc(128 * 768);
+
+    // EdgeBert_init(dev, plic_dev, mem);
+    count = 0;
+
+    for (int i = 0; i < 8; i++) {
+        memcpy(input_1, relu_output + i * N0 * M_mat, N0 * M_mat * sizeof(token_t));
+
+        for (int j = 0; j < 48; j++) {
+            memcpy(input_2, we2_mat + j * M_mat * N1, M_mat * N1 * sizeof(token_t));
+
+            if (count == 2) {
+                // EdgeBert_init(dev, plic_dev, mem);
+                count = 0;
+            }
+
+            EdgeBert_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, input_1, input_2, softmax);
+            // memcpy(we2_output + N0 * N1 * i * j, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
+
+            for (int l = 0; l < N0; l++) {
+                for (int k = 0; k < N1; k++) {
+                    we2_output[(l + i * N0) * 768 + j * N1 + k] = mem[mask_buffer_size + 2 * input_buffer_size + aux_buffer_size + l * N0 + k];
+                }
+            }
+            count++;
+        }
+    }
+
+    aligned_free(input_1);
+    aligned_free(input_2);
+
+    N0 = 64;
+    M_mat = 768;
+    N1 = 64;
+
+    // Add attention output
+    token_t* FFN_output;
+    input_1 = aligned_malloc(N0 * M_mat);
+    input_2  = aligned_malloc(M_mat * N1);
+    CPU_transpose(processing_out, 768, 128);
+    FFN_output = aligned_malloc(128*768);
+
+    for (int i = 0; i < 2; i++) {
+        // Add parts of attention output
+        memcpy(input_1, we2_output + i * N0 * M_mat, N0 * M_mat * sizeof(token_t));
+        memcpy(input_2, processing_out + i * N1 * M_mat, N1 * M_mat * sizeof(token_t));
+        EdgeBert_init(dev, plic_dev, mem);
+        EdgeBert_ElementAddLayerNorm(dev, plic_dev, N0, N1, M_mat, mem, input_1, input_2);
+        memcpy(FFN_output + i * N0 * M_mat, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * M_mat * sizeof(token_t));
+    }
+
+    // Free memory
+    aligned_free(input_1);
+    aligned_free(input_2);
+    aligned_free(we2_output);
+    aligned_free(mask_mat);
+    aligned_free(we1_mat);
+    aligned_free(we2_mat);
+    aligned_free(relu_output);
+
     count2 = get_counter();
     printf("FINISHing EdgeBERT Feed Forward Net Computation...\n");
     printf("###(taking %"PRIu64" clock cycles)###...\n", count2 - count1);
+}
+
+static void EdgeBert_transformer(
+    struct esp_device *dev,
+    struct esp_device *plic_dev,
+    token_t *mem,
+    int num_heads,
+    int input_m,
+    int input_n,
+    int output_n
+) {
+    printf("\n");
+    printf("  #######  ######      ######       ####    #     #    #####   \n");
+    printf("  #        #     #    #      #     #        #     #   #     #  \n");
+    printf("  #        #     #   #        #   #         #     #   #        \n");
+    printf("  #######  ######    #        #   #         #######    #####   \n");
+    printf("  #        #         #        #   #         #     #         #  \n");
+    printf("  #        #          #      #     #        #     #   #     #  \n");
+    printf("  #######  #           ######       ####    #     #    #####   \n");
+    printf("\n");
+
+    // Attention heads
+    token_t *attention_heads = EdgeBert_attention_heads(dev, plic_dev, mem, num_heads, input_m, input_n, output_n);
+
+    // Processing
+    token_t* attention_out = EdgeBert_processing(&dev, &plic_dev, mem, attention_heads);
+
+    // Feed Forward Neural Net
+    EdgeBert_feed_forward(&dev, &plic_dev, mem, attention_out);
+
     printf("\nEdgeBERT Transformer Layer DONE...\n");
     printf("Thank you!\n");
 
@@ -1462,7 +1495,6 @@ int main(int argc, char * argv[]) {
     // Accelerator estimation
     // Total mem size
     mem_size = mask_buffer_size + aux_buffer_size + 3 * input_buffer_size;
-
     // Allocation of the accelerator data array (mem)
     mem = aligned_malloc(mem_size);
 
