@@ -495,9 +495,10 @@ static void CPU_EdgeBert_attention_heads(
 }
 
 static void CPU_EdgeBert_processing(
-    int head_m,
-    int head_n,
-    int input_n
+    int num_heads,
+    int input_m,
+    int input_n,
+    int hidden_size
 ) {
     printf("STARTing CPU 12 Attention Heads Processing...\n");
     uint64_t count1;
@@ -505,21 +506,23 @@ static void CPU_EdgeBert_processing(
     count1 = get_counter();
 
     // Initialize weights for processing
-    int *attention_head_cpu;
-    attention_head_cpu = aligned_malloc(head_m * head_n * sizeof(int));
-    int *we_heads_cpu;
-    we_heads_cpu = aligned_malloc(head_n * input_n * sizeof(int));
+    int *attention_heads;
+    attention_heads = aligned_malloc(input_m * hidden_size * num_heads * sizeof(int));
+    int *we_heads;
+    we_heads = aligned_malloc(hidden_size * num_heads * input_n * sizeof(int));
+    int *attention_heads_out;
+    attention_heads = aligned_malloc(input_m * input_n * sizeof(int));
 
     // Fill weight matrix with dummy data
-    for (int i = 0; i < head_n * input_n; i++) {
-        we_heads_cpu[i] = -1;
+    for (int i = 0; i < hidden_size * num_heads * input_n; i++) {
+        we_heads[i] = -1;
     }
 
     int N0;
     int N1;
     int M_mat;
-    N0 = head_m; M_mat = head_n; N1 = input_n;
-    CPU_multiply(attention_head_cpu, we_heads_cpu, N0, M_mat, N1, attention_head_out_cpu);
+    N0 = input_m; M_mat = hidden_size * num_heads; N1 = input_n;
+    CPU_multiply(attention_heads, we_heads, N0, M_mat, N1, attention_head_out_cpu);
 
     // Layer normalization?
 
@@ -532,8 +535,7 @@ static void CPU_EdgeBert_processing(
 static void CPU_EdgeBert_feed_forward(
     int input_m,
     int input_n,
-    int we_n,
-    int out_n
+    int hidden_size_ffn,
 ) {
     printf("STARTing CPU Feed Forward Net Computation...\n");
     uint64_t count1;
@@ -547,25 +549,25 @@ static void CPU_EdgeBert_feed_forward(
     int *output1;
     int *output2;
     attention_head_out = aligned_malloc(input_m * input_n * sizeof(int));
-    we1 = aligned_malloc(input_n * we_n * sizeof(int));
-    we2 = aligned_malloc(we_n * out_n * sizeof(int));
-    output1 = aligned_malloc(input_m * we_n * sizeof(int));
-    output2 = aligned_malloc(input_m * out_n * sizeof(int));
+    we_mat1 = aligned_malloc(input_n * hidden_size_ffn * sizeof(int));
+    we_mat2 = aligned_malloc(hidden_size_ffn * input_n * sizeof(int));
+    output1 = aligned_malloc(input_m * hidden_size_ffn * sizeof(int));
+    output2 = aligned_malloc(input_m * input_n * sizeof(int));
 
     // Fill with dummy data
-    for (int i = 0; i < 128 * 768; i++) {
+    for (int i = 0; i < input_m * input_n; i++) {
         attention_head_out[i] = 38;
     }
-    for (int i = 0; i < 3072 * 768; i++) {
-        we1[i] = 24;
-        we2[i] = -5;
+    for (int i = 0; i < input_n * hidden_size_ffn; i++) {
+        we_mat1[i] = 24;
+        we_mat2[i] = -5;
     }
 
     // Matrix configuration
     int N0;
     int N1;
     int M_mat;
-    N0 = input_m; M_mat = input_n; N1 = we_n;
+    N0 = input_m; M_mat = input_n; N1 = hidden_size_ffn;
 
     // First multiplication with attention output
     CPU_multiply(attention_head_out, we1, N0, M_mat, N1, output1);
@@ -573,7 +575,7 @@ static void CPU_EdgeBert_feed_forward(
     // Activation function?
 
     // Second multiplication
-    N0 = input_m; M_mat = we_n; N1 = out_n;
+    N0 = input_m; M_mat = hidden_size_ffn; N1 = input_n;
     CPU_multiply(output1, we2, N0, M_mat, N1, output2);
 
     // Layer normalization?
