@@ -1,8 +1,8 @@
 /* Copyright (c) 2011-2021 Columbia University, System Level Design Group */
 /* SPDX-License-Identifier: Apache-2.0 */
 
-#ifndef __ALBERT_H__
-#define __ALBERT_H__
+#ifndef __EDGEBERT_REAL_H__
+#define __EDGEBERT_REAL_H__
 
 #define ACC_BASE_ADDR 0x60400000
 #define ACC_OFFSET 0x100000
@@ -17,4 +17,4 @@
 #define CSR_REG_OFFSET 4
 #define CSR_TILE_ADDR (CSR_BASE_ADDR + CSR_TILE_OFFSET * TILE_ID)
 
-#endif /* __ALBERT_H__ */
+#endif /* __EDGEBERT_REAL_H__ */
