@@ -294,46 +294,43 @@ static void CPU_EdgeBert_init_buf_attention(int *input_ids, int *we_query, int *
     #include "data/attention/we_query.h"      // 768 * 64
     #include "data/attention/we_key.h"        // 768 * 64
     #include "data/attention/we_val.h"        // 768 * 64
-    // #include "data/attention/highway_exit.h"
-    // #include "data/attention/entropy.h"
+}
+
+static void CPU_EdgeBert_init_buf_pooler(int *we_mat1) {
+    // #include "data/pooler/we_mat1.h"
+}
+
+static void CPU_EdgeBert_init_buf_highway(int *we_mat1, int *we_mat2, int *entropy) {
+    // #include "data/highway/we_mat1.h"
+    // #include "data/highway/we_mat2.h"
 }
 
 static void CPU_EdgeBert_init_buf_processing(int *we_mat1) {
-    // #include "data/processing/we_mat1.h"       // 768 * 768
+    #include "data/processing/we_mat1.h"      // 768 * 768
 }
 
 static void CPU_EdgeBert_init_buf_ffn(int *we_mat1, int *we_mat2) {
-    // #include "data/ffn/we_mat1.h"              // 768 * 3072
-    // #include "data/ffn/we_mat2.h"              // 3072 * 768
+    #include "data/ffn/we_mat1.h"             // 768 * 3072
+    #include "data/ffn/we_mat2.h"             // 3072 * 768
 }
 
 // Transformer profiling
 // Pooler
-static void CPU_EdgeBert_pooler(
+static int *CPU_EdgeBert_pooler(
+    int *attention_heads,
     int input_m,
     int hidden_size
 ) {
-    // Initialize output heads
-    int *attention_heads;
-    attention_heads = aligned_malloc(input_m * hidden_size * sizeof(int));
-
-    // Fill with dummy data
-    for (int i = 0; i < input_m * hidden_size; i++) {
-        attention_heads[i] = 12;
-    }
-
     // Weight matrix (hidden_size * hidden_size)
-    int *we;
+    int *we_mat1;
     int *output;
 
     // Allocate space for matrices
-    we = aligned_malloc(hidden_size * hidden_size * sizeof(int));
+    we_mat1 = aligned_malloc(hidden_size * hidden_size * sizeof(int));
     output = aligned_malloc(input_m * hidden_size * sizeof(int));
 
-    // Fill with dummy data
-    for (int i = 0; i < hidden_size * hidden_size; i++) {
-        we[i] = 10;
-    }
+    // Fill with data
+    init_buf_pooler(we_mat1);
 
     // Matrix multiplication configurations
     int N0;
@@ -342,7 +339,7 @@ static void CPU_EdgeBert_pooler(
     N0 = input_m; M_mat = hidden_size; N1 = hidden_size;
 
     // Query multiplication
-    CPU_multiply(we, attention_heads, N0, M_mat, N1, output);
+    CPU_multiply(we_mat1, attention_heads, N0, M_mat, N1, output);
 
     // Activation?
 
@@ -351,47 +348,44 @@ static void CPU_EdgeBert_pooler(
     out = aligned_malloc(hidden_size * sizeof(int));
     memcpy(out, output, hidden_size * sizeof(int));
 
-    aligned_free(we);
+    // Free allocated space
+    aligned_free(we_mat1);
     aligned_free(output);
-    aligned_free(out);
+
+    return out;
 }
 
 // Highway Exit
-static void CPU_EdgeBert_highway_exit(
+static int *CPU_EdgeBert_highway_exit(
+    int *attention_heads,
     int input_m,
     int hidden_size,
     int he_layer1,
     int he_layer2
 ) {
-    CPU_EdgeBert_pooler(input_m, hidden_size);
-    int *pooler_output;
+    int *pooler_output = CPU_EdgeBert_pooler(attention_heads, input_m, hidden_size);
     int *we_mat1;
     int *we_mat2;
     int *output1;
     int *output2;
 
-    pooler_output = aligned_malloc(hidden_size * sizeof(int));
     we_mat1 = aligned_malloc(he_layer1 * hidden_size * sizeof(int));
-    we_mat1 = aligned_malloc(he_layer2 * he_layer1 * sizeof(int));
+    we_mat2 = aligned_malloc(he_layer2 * he_layer1 * sizeof(int));
     output1 = aligned_malloc(he_layer1 * sizeof(int));
     output2 = aligned_malloc(he_layer2 * sizeof(int));
 
-    // Fill with dummy data
-    for (int i = 0; i < hidden_size; i++) {
-        pooler_output[i] = 1;
-    }
-    for (int i = 0; i < he_layer1 * hidden_size; i++) {
-        we_mat1[i] = 4;
-    }
-    for (int i = 0; i < he_layer2 * he_layer1; i++) {
-        we_mat2[i] = 2;
-    }
+    // Fill with data
+    CPU_EdgeBert_init_buf_highway(we_mat1, we_mat2);
 
+    // Mutliply pooler output by first matrix
     int N0;
     int N1;
     int M_mat;
     N0 = he_layer1; M_mat = hidden_size; N1 = 1;
     CPU_multiply(we_mat1, pooler_output, N0, M_mat, N1, output1);
+    aligned_free(pooler_output);
+
+    // Multiply by second matrix
     N0 = he_layer2; M_mat = he_layer1; N1 = 1;
     CPU_multiply(we_mat2, output1, N0, M_mat, N1, output2);
 
@@ -401,10 +395,17 @@ static void CPU_EdgeBert_highway_exit(
     // if (entropy < threshold) {
     //     return output2;
     // }
+
+    // Free allocated space
+    aligned_free(we_mat1);
+    aligned_free(we_mat2);
+    aligned_free(output1);
+
+    return output2;
 }
 
 // Attention head
-static void CPU_EdgeBert_attention(
+static int *CPU_EdgeBert_attention(
     int input_m,
     int input_n,
     int hidden_size,
@@ -412,7 +413,7 @@ static void CPU_EdgeBert_attention(
     int he_layer2
 ) {
     printf("STARTing Attention Head in CPU...\n");
-    
+
     // Initialize inputs, weights, and outputs
     int *input_ids;
     int *we_query;
@@ -431,6 +432,7 @@ static void CPU_EdgeBert_attention(
     output2 = aligned_malloc(input_m * hidden_size * sizeof(int));
     output3 = aligned_malloc(input_m * hidden_size * sizeof(int));
 
+    // Load in data
     CPU_EdgeBert_init_buf_attention(input_ids, we_query, we_key, we_val);
 
     // Matrix multiplication configurations
@@ -473,11 +475,12 @@ static void CPU_EdgeBert_attention(
     aligned_free(output2);
     aligned_free(output3);
     aligned_free(output4);
-    aligned_free(output5);
+
     printf("FINISHing Attention Head in CPU...\n");
+    return output5;
 }
 
-static void CPU_EdgeBert_attention_heads(
+static int *CPU_EdgeBert_attention_heads(
     int num_heads,
     int input_m,
     int input_n,
@@ -502,7 +505,7 @@ static void CPU_EdgeBert_attention_heads(
     for (int i = 0; i < 12; i++) {
         // Get time for each head
         count1 = get_counter();
-        CPU_EdgeBert_attention(
+        int *attention_output = CPU_EdgeBert_attention(
             input_m,
             input_n,
             hidden_size,
@@ -517,24 +520,29 @@ static void CPU_EdgeBert_attention_heads(
         // Fill output with dummy data
         for (int l = 0; l < input_m; l++) {
             for (int k = 0; k < hidden_size; k++) {
-                attention_heads[l * hidden_size * num_heads + i * hidden_size + k] = l * hidden_size + k;
+                attention_heads[l * hidden_size * num_heads + i * hidden_size + k] = attention_output[l * hidden_size + k];
             }
         }
 
         // Highway exit
-        CPU_EdgeBert_highway_exit(input_m, hidden_size, he_layer1, he_layer2);
-        // if (out) {
+        int *highway_exit = CPU_EdgeBert_highway_exit(attention_output, input_m, hidden_size, he_layer1, he_layer2);
+        aligned_free(attention_output);
+        aligned_free(highway_exit);
+
+        // if (highway_exit) {
         //     printf("FINISHing CPU 12 Attention Heads Computation EARLY...\n");
         //     printf("###(%"PRIu64" clock cycles)###\n", total_exe_cycle);
-        //     return;
+        //     return highway_exit;
         // }
     }
 
     printf("FINISHing CPU 12 Attention Heads Computation...\n");
     printf("###(%"PRIu64" clock cycles)###\n", total_exe_cycle);
+    return attention_heads;
 }
 
-static void CPU_EdgeBert_processing(
+static int *CPU_EdgeBert_processing(
+    int *attention_heads,
     int num_heads,
     int input_m,
     int input_n,
@@ -547,34 +555,34 @@ static void CPU_EdgeBert_processing(
     count1 = get_counter();
 
     // Initialize weights for processing
-    int *attention_heads;
-    int *we_heads;
+    int *we_mat1;
     int *attention_heads_out;
 
-    attention_heads = aligned_malloc(input_m * hidden_size * num_heads * sizeof(int));
-    we_heads = aligned_malloc(hidden_size * num_heads * input_n * sizeof(int));
+    we_mat1 = aligned_malloc(hidden_size * num_heads * input_n * sizeof(int));
     attention_heads = aligned_malloc(input_m * input_n * sizeof(int));
 
-    // Fill weight matrix with dummy data
-    for (int i = 0; i < hidden_size * num_heads * input_n; i++) {
-        we_heads[i] = -1;
-    }
+    // Fill matrix with data
+    CPU_EdgeBert_init_buf_processing(we_mat1);
 
+    // Multiply output by matrix
     int N0;
     int N1;
     int M_mat;
     N0 = input_m; M_mat = hidden_size * num_heads; N1 = input_n;
-    CPU_multiply(attention_heads, we_heads, N0, M_mat, N1, attention_heads_out);
+    CPU_multiply(attention_heads, we_mat1, N0, M_mat, N1, attention_heads_out);
+    aligned_free(attention_heads);
 
     // Layer normalization?
 
     count2 = get_counter();
     printf("FINISHing CPU Attention Heads Processing...\n");
     printf("###(%"PRIu64" clock cycles)###\n", count2 - count1);
+    return attention_heads_out;
 }
 
 // Feed forward neural network after attention heads
-static void CPU_EdgeBert_feed_forward(
+static int *CPU_EdgeBert_feed_forward(
+    int *attention_head_out,
     int input_m,
     int input_n,
     int hidden_size_ffn
@@ -587,26 +595,18 @@ static void CPU_EdgeBert_feed_forward(
     count1 = get_counter();
 
     // Initialize input, weights, and outputs
-    int *attention_head_out;
     int *we_mat1;
     int *we_mat2;
     int *output1;
     int *output2;
 
-    attention_head_out = aligned_malloc(input_m * input_n * sizeof(int));
     we_mat1 = aligned_malloc(input_n * hidden_size_ffn * sizeof(int));
     we_mat2 = aligned_malloc(hidden_size_ffn * input_n * sizeof(int));
     output1 = aligned_malloc(input_m * hidden_size_ffn * sizeof(int));
     output2 = aligned_malloc(input_m * input_n * sizeof(int));
 
     // Fill with dummy data
-    for (int i = 0; i < input_m * input_n; i++) {
-        attention_head_out[i] = 38;
-    }
-    for (int i = 0; i < input_n * hidden_size_ffn; i++) {
-        we_mat1[i] = 24;
-        we_mat2[i] = -5;
-    }
+    CPU_EdgeBert_init_buf_ffn(we_mat1, we_mat2);
 
     // Matrix configuration
     int N0;
@@ -628,6 +628,8 @@ static void CPU_EdgeBert_feed_forward(
     count2 = get_counter();
     printf("FINISHing CPU Feed Forward Net Computation...\n");
     printf("###(%"PRIu64" clock cycles)###\n", count2 - count1);
+
+    return output2;
 }
 
 // Profile CPU performance
@@ -641,7 +643,7 @@ static void CPU_transformer(
     int hidden_size_ffn
 ) {
     printf("Transformer Matmul Performance Profiling on Ariane RISC-V CPU BEGIN...\n");
-    CPU_EdgeBert_attention_heads(
+    int *attention_heads = CPU_EdgeBert_attention_heads(
         num_heads,
         input_m,
         input_n,
@@ -650,18 +652,21 @@ static void CPU_transformer(
         he_layer2
     );
     printf("\n");
-    CPU_EdgeBert_processing(
+    int *attention_head_out = CPU_EdgeBert_processing(
+        attention_heads,
         num_heads,
         input_m,
         input_n,
         hidden_size
     );
     printf("\n");
-    CPU_EdgeBert_feed_forward(
+    int *out = CPU_EdgeBert_feed_forward(
+        attention_head_out,
         input_m,
         input_n,
         hidden_size_ffn
     );
+    aligned_free(out);
     printf("Transformer Matmul Performance Profiling on Ariane RISC-V CPU DONE...\n");
     printf("Thank you!\n");
 }
@@ -1692,7 +1697,7 @@ static void EdgeBert_transformer(
     int input_m,
     int input_n,
     int hidden_size,
-    int he_layer1, 
+    int he_layer1,
     int he_layer2,
     int hidden_size_ffn
 ) {
