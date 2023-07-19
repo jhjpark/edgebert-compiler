@@ -736,30 +736,36 @@ static void CPU_transformer(
 
 // Wait for interrupt
 static int wait(struct esp_device *plic_dev, int num_interrupts) {
-    // printf("......waiting for interrupt #%d\n", num_interrupts);
+    printf("......waiting for interrupt #%d\n", num_interrupts + 1);
     // iointerrupt();
     while((ioread32(plic_dev, PLIC_IP_OFFSET) & 0x40) == 0);
     iowrite32(plic_dev, PLIC_INTACK_OFFSET, EDGEBERT_IRQ + 1);
     iowrite32(plic_dev, 0x2000, 0x40);
     iowrite32(plic_dev, 0x18, 0x2);
     ioread32(plic_dev, PLIC_INTACK_OFFSET);
-    // printf("......receiving for interrupt #%d\n", num_interrupts);
+    printf("......receiving for interrupt #%d\n", num_interrupts + 1);
     return num_interrupts + 1;
 }
 
 
 // Frequently used functions
-static void master_mask_read(
+static int master_mask_read(
     struct esp_device *dev,
     struct esp_device *plic_dev,
     unsigned mask_rd_base,
     unsigned decoder,
+    unsigned M,
     int num_interrupts
 ) {
     // Master mask read (load from outside and store in accelerator MASK scratchpad)
     unsigned data = 0;
+
     // Not writing to memory
     iowrite32(dev, 0x4C, data);
+
+    // Set number of words
+    data = M - 1;
+    iowrite32(dev, 0x40, data);
 
     // Set mask read address
     data = mask_rd_base;
@@ -777,36 +783,23 @@ static void master_mask_read(
     return wait(plic_dev, num_interrupts);
 }
 
-static void master_aux_read(
-    struct esp_device *dev,
-    struct esp_device *plic_dev,
-    unsigned aux_rd_base,
-    int num_interrupts
-) {
-    unsigned data = 0;
-    // Not writing to memory
-    iowrite32(dev, 0x4C, data);
-    // Set aux read base
-    data = aux_rd_base;
-    iowrite32(dev, 0x38, data);
-    // Start master aux read
-    data = 0x05;
-    iowrite32(dev, 0x04, data);
-    // Wait for interrupt
-    return wait(plic_dev, num_interrupts);
-}
-
-static void master_input_read(
+static int master_input_read(
     struct esp_device *dev,
     struct esp_device *plic_dev,
     unsigned input_rd_base,
     unsigned decoder,
+    unsigned M,
     int num_interrupts
 ) {
+    // Master input read (load from outside and store in accelerator INPUT scratchpad)
     unsigned data = 0;
 
     // Not writing to memory
     iowrite32(dev, 0x4C, data);
+
+    // Set number of words
+    data = M - 1;
+    iowrite32(dev, 0x40, data);
 
     // Set decoder
     data = decoder;
@@ -824,29 +817,93 @@ static void master_input_read(
     return wait(plic_dev, num_interrupts);
 }
 
-static void master_input_write(
+static int master_aux_read(
     struct esp_device *dev,
-    struct esp_device *plic_dev
+    struct esp_device *plic_dev,
+    unsigned aux_rd_base,
+    unsigned M,
+    int num_interrupts
 ) {
+    // Master aux read (load from outside and store in accelerator AUX scratchpad)
     unsigned data = 0;
-    // Set use_axi to 1
-    data = 0x1;
+
+    // Set number of words
+    data = M - 1;
+    iowrite32(dev, 0x44, data);
+
+    // Not writing to memory
     iowrite32(dev, 0x4C, data);
-    // Start input master write
-    data = 0x04;
+
+    // Set aux read base
+    data = aux_rd_base;
+    iowrite32(dev, 0x38, data);
+
+    // Start master aux read
+    data = 0x05;
     iowrite32(dev, 0x04, data);
+
     // Wait for interrupt
     return wait(plic_dev, num_interrupts);
 }
 
-static void mat_mul(
+static int master_mask_write(
+    struct esp_device *dev,
+    struct esp_device *plic_dev,
+    unsigned M,
+    int num_interrupts
+) {
+    unsigned data = 0;
+
+    // Set use_axi to 1
+    data = 0x1;
+    iowrite32(dev, 0x4C, data);
+
+    // Set number of words
+    data = M - 1;
+    iowrite32(dev, 0x40, data);
+
+    // Start input master write
+    data = 0x02;
+    iowrite32(dev, 0x04, data);
+
+    // Wait for interrupt
+    return wait(plic_dev, num_interrupts);
+}
+
+static int master_input_write(
+    struct esp_device *dev,
+    struct esp_device *plic_dev,
+    unsigned M,
+    int num_interrupts
+) {
+    unsigned data = 0;
+
+    // Set use_axi to 1
+    data = 0x1;
+    iowrite32(dev, 0x4C, data);
+
+    // Set number of words
+    data = M - 1;
+    iowrite32(dev, 0x40, data);
+
+    // Start input master write
+    data = 0x04;
+    iowrite32(dev, 0x04, data);
+
+    // Wait for interrupt
+    return wait(plic_dev, num_interrupts);
+}
+
+static int mat_mul(
     struct esp_device *dev,
     struct esp_device *plic_dev,
     int N0,
     int M_mat,
-    int N1
+    int N1,
+    int num_interrupts
 ) {
     unsigned data = 0x0;
+
     // Start matrix size configurations
     data += N0;
     data += N1 << 10;
@@ -859,7 +916,6 @@ static void mat_mul(
     data += base_input1 << 16;
     iowrite32(dev, 0x14, data);
 
-    // QUESTION: Example of offset? Set as argument?
     // Set offset
     data = 0;
     iowrite32(dev, 0x18, data);
@@ -876,23 +932,33 @@ static void mat_mul(
 // Core functions
 // Read for mask (decoder 0 and 1) and aux, set base addresses for read and write
 static int EdgeBert_init(struct esp_device *dev, struct esp_device *plic_dev, token_t *mem) {
+    printf("...STARTing base addr setting for EdgeBert...\n");
+
     // TODO: Our reset hack
     iowrite32(dev, 0x00, 1);
 
     unsigned data = 0;
     int num_interrupts = 0;
 
-    printf("...STARTing base addr setting for EdgeBert...\n");
-
     // Calculate base addresses
     // Base address
-    unsigned mask_rd1_base = ((unsigned) mem);
-    unsigned mask_rd2_base = ((unsigned) mem) + mask_buffer_size;
-    unsigned input_rd1_base = ((unsigned) mem) + 2 * mask_buffer_size;
-    unsigned input_rd2_base = ((unsigned) mem) + 2 * mask_buffer_size + input_buffer_size;
-    unsigned aux_rd_base = ((unsigned) mem) + 2 * mask_buffer_size + 2 * input_buffer_size;
-    unsigned input_wr_base = ((unsigned) mem) + 2 * mask_buffer_size + 2 * input_buffer_size + aux_buffer_size;
-    unsigned mask_wr_base = ((unsigned) mem) + 2 * mask_buffer_size + 3 * input_buffer_size + aux_buffer_size;
+    unsigned mask_rd1_base = ((uintptr_t) mem);
+    unsigned mask_rd2_base = ((uintptr_t) mem) + mask_buffer_size;
+    unsigned input_rd1_base = ((uintptr_t) mem) + 2 * mask_buffer_size;
+    unsigned input_rd2_base = ((uintptr_t) mem) + 2 * mask_buffer_size + input_buffer_size;
+    unsigned aux_rd_base = ((uintptr_t) mem) + 2 * mask_buffer_size + 2 * input_buffer_size;
+    unsigned input_wr_base = ((uintptr_t) mem) + 2 * mask_buffer_size + 2 * input_buffer_size + aux_buffer_size;
+    unsigned mask_wr_base = ((uintptr_t) mem) + 2 * mask_buffer_size + 3 * input_buffer_size + aux_buffer_size;
+
+    // Use 8-bit MAC
+    data = 0;
+    iowrite32(dev, 0x60, data);
+    // Set mask write address
+    data = mask_wr_base;
+    iowrite32(dev, 0x2C, data);
+    // Set input write address
+    data = input_wr_base;
+    iowrite32(dev, 0x34, data);
 
     data = 0;
     // Store base output of computations
@@ -904,21 +970,14 @@ static int EdgeBert_init(struct esp_device *dev, struct esp_device *plic_dev, to
     // Set mode to N0
     data = 0x81;
     iowrite32(dev, 0x58, data);
-    // Use 8-bit MAC
-    data = 0;
-    iowrite32(dev, 0x60, data);
-    // Set mask write address
-    data = mask_wr_base;
-    iowrite32(dev, 0x2C, data);
-    // Set input write address
-    data = input_wr_base;
-    iowrite32(dev, 0x34, data);
+    // Set number of words
+    data = M - 1;
+    iowrite32(dev, 0x40, data);
 
     printf("...FINISHing base addr setting for EdgeBert...\n");
 }
 
 // Matrix multiplication
-// QUESTION: What happens if the softmax is not big enough?
 static void EdgeBert_mat_mul(
     struct esp_device *dev,
     struct esp_device *plic_dev,
@@ -939,17 +998,16 @@ static void EdgeBert_mat_mul(
 
     // Calculate base addresses
     unsigned data = 0;
-    unsigned mask_rd1_base = ((unsigned) mem);
-    unsigned mask_rd2_base = ((unsigned) mem) + mask_buffer_size;
-    unsigned input_rd1_base = ((unsigned) mem) + 2 * mask_buffer_size;
-    unsigned input_rd2_base = ((unsigned) mem) + mask_buffer_size + input_buffer_size;
+    unsigned mask_rd1_base = ((uintptr_t) mem);
+    unsigned mask_rd2_base = ((uintptr_t) mem) + mask_buffer_size;
+    unsigned input_rd1_base = ((uintptr_t) mem) + 2 * mask_buffer_size;
+    unsigned input_rd2_base = ((uintptr_t) mem) + mask_buffer_size + input_buffer_size;
 
     // Loads in matrices from memory
     memcpy(mem, mask_mat1, mask_buffer_size * sizeof(token_t));
     memcpy(mem + mask_buffer_size, mask_mat2, mask_buffer_size * sizeof(token_t));
     memcpy(mem + 2 * mask_buffer_size, D_mat1, N0 * M_mat * sizeof(token_t));
     memcpy(mem + 2 * mask_buffer_size + input_buffer_size, D_mat2, M_mat * N1 * sizeof(token_t));
-    // QUESTION: Is the aux only for layer normalization?
 
     // Load in matrices to accelerator
     data = 0;
@@ -957,10 +1015,16 @@ static void EdgeBert_mat_mul(
     iowrite32(dev, 0x40, data);
 
     // Master mask read (load from outside and store in accelerator MASK scratchpad) for decoder 0
-    num_interrupts = master_mask_read(dev, plic_dev, mask_rd1_base, 0x0, num_interrupts);
+    num_interrupts = master_mask_read(dev, plic_dev, mask_rd1_base, 0x0, M, num_interrupts);
 
     // Master mask read (load from outside and store in accelerator MASK scratchpad) for decoder 1
-    num_interrupts = master_mask_read(dev, plic_dev, mask_rd2_base, 0x1, num_interrupts);
+    num_interrupts = master_mask_read(dev, plic_dev, mask_rd2_base, 0x1, M, num_interrupts);
+
+    // Load in data to decoder 0
+    num_interrupts = master_input_read(dev, plic_dev, input_rd1_base, 0x0, M, num_interrupts);
+
+    // Load in data to decoder 1
+    num_interrupts = master_input_read(dev, plic_dev, input_rd2_base, 0x1, M, num_interrupts);
 
     // Set post-processing configuration
     data = 0;
@@ -971,985 +1035,1131 @@ static void EdgeBert_mat_mul(
     data += accum_right_shift << 20;
     iowrite32(dev, 0x0C, data);
 
-    // Load in data to decoder 0
-    num_interrupts = master_input_read(dev, plic_dev, input_rd1_base, 0x0, num_interrupts);
-
-    // Load in data to decoder 1
-    num_interrupts = master_input_read(dev, plic_dev, input_rd2_base, 0x1, num_interrupts);
-
     // QUESTION: Change base_output?
     // Do matrix multiplication
-    num_interrupts = mat_mul(dev, plic_dev, N0, M_mat, N1);
+    num_interrupts = mat_mul(dev, plic_dev, N0, M_mat, N1, num_interrupts);
 
     // Write data outside
     if (softmax == 0) {
         // QUESTION: How to set the address that you write from?
         // QUESTION: Set num words to write?
-        master_input_write(dev, plic_dev);
+        master_input_write(dev, plic_dev, M, num_interrupts);
     }
 
     printf("...FINISHing Matmul in EdgeBert...\n");
 }
 
-static void general_mat_mul(
+// static void general_mat_mul(
+//     struct esp_device *dev,
+//     struct esp_device *plic_dev,
+//     int N0,
+//     int N1,
+//     int M_mat,
+//     int is_relu,
+//     token_t *mem,
+//     token_t *mask_mat1,
+//     token_t *mask_mat2,
+//     token_t *D_mat1,
+//     token_t *D_mat2,
+//     int softmax
+// ) {
+//     // TODO: Add another mask_mat argument
+//     // TODO: Deal with masks
+//     unsigned N0_tile;
+//     unsigned N1_tile;
+
+//     // Try to get as many columns
+//     N1_tile = input_buffer_size / M_mat;
+//     N0_tile = input_buffer_size / (M_mat + N1_tile);
+
+//     // Assume that at least one row and output can fit
+//     assert(N0_tile != 0);
+//     EdgeBert_init(dev, plic_dev, mem);
+
+//     // Allocate memory for matrices
+//     token_t *left;
+//     token_t *right;
+//     token_t *output;
+
+//     left = aligned_malloc(N0_tile * M_mat);
+//     right = aligned_malloc(M_mat * N1_tile);
+//     output = aligned_malloc(N0 * N1);
+
+//     // Tranpose for easier access
+//     CPU_transpose(D_mat2, M_mat, N1);
+
+//     int count = 0;
+//     int row = 0, col = 0;
+//     while (row < N0) {
+//         // Get left matrix
+//         unsigned N0_mat = min(N0_tile, N0 - row);
+//         memcpy(left, D_mat1 + M_mat * row, N0_mat * M_mat * sizeof(token_t));
+//         while (col < N1) {
+//             // Get right matrix
+//             unsigned N1_mat = min(N1_tile, N1 - col);
+//             memcpy(right, D_mat + M_mat * col, N1_mat * M_mat * sizeof(token_t));
+//             CPU_transpose(right, N1_mat, M_mat);
+
+//             // Multiply
+//             EdgeBert_mat_mul(dev, plic_dev, N0_mat, N1_mat, M_mat, is_relu, mem, mask_mat, left, right, softmax);
+
+//             // Copy over data into relu_output
+//             for (int l = 0; l < N0_mat; l++) {
+//                 for (int k = 0; k < N1_mat; k++) {
+//                     relu_output[(row + l) * N1 + col + k] = mem[mask_buffer_size + 2 * input_buffer_size + aux_buffer_size + l * N0_mat + k];
+//                 }
+//             }
+//             col += N1_mat;
+//             count++;
+//         }
+//         row += N0_mat;
+//     }
+// }
+
+// // QUESTION: Softmax if the whole row cannot fit?
+// // Softmax for attention head
+// static void EdgeBert_atten_softmax(
+//     struct esp_device *dev,
+//     struct esp_device *plic_dev,
+//     int N0,
+//     int N1,
+//     int M_mat
+// ) {
+//     printf("STARTing attention softmax in EdgeBert...\n");
+//     unsigned data = 0;
+//     int num_interrupts;
+
+//     // Calculate softmax
+//     // Set use_gb and reset_mode
+//     // Choose decoder 0
+//     data = 0x0;
+//     iowrite32(dev, 0x08, data);
+//     // Set SFU to true
+//     data = 0x1;
+//     iowrite32(dev, 0x50, data);
+//     // Set softmax for decoder 0
+//     data = 0x08;
+//     iowrite32(dev, 0x58, data);
+//     // Set mode to softmax
+//     data = 0x02;
+//     iowrite32(dev, 0x54, data);
+//     // Configure parameters
+//     data = 0;
+//     data += base_attn_span;
+//     data += base_gamma << 7;
+//     data += base_beta << 15;
+//     data += adpbias_attn_span << 23;
+//     data += adpbias_gamma << 26;
+//     data += adpbias_beta << 29;
+//     iowrite32(dev, 0x1C, data);
+//     data = 0;
+//     data += num_vector;
+//     data += num_timestep << 8;
+//     data += adpbias_act1 << 16;
+//     data += adpbias_act2 << 20;
+//     data += adpbias_act3 << 24;
+//     iowrite32(dev, 0x20, data);
+//     // Configure matrix size
+//     data = 0x0;
+//     data += N0;
+//     data += N1 << 10;
+//     data += M_mat << 20;
+//     iowrite32(dev, 0x10, data);
+
+//     // QUESTION: Where is the softmax written to? Can it be set?
+//     // QUESTION: Where does it read in from?
+//     // Set base of matrix
+//     data = 0;
+//     data += base_input0;
+//     data += base_input1 << 16;
+//     iowrite32(dev, 0x14, data);
+//     // Set offset
+//     data = 0;
+//     iowrite32(dev, 0x18, data);
+//     // Set to decoder 0
+//     data = 0x0;
+//     iowrite32(dev, 0x08, data);
+//     // Start softmax
+//     data = 0x9;
+//     iowrite32(dev, 0x04, data);
+//     // Wait for interrupt
+//     num_interrupts = wait(plic_dev, num_interrupts);
+
+//     // Master input write (load from accelerator DATA scratchpad and store outside)
+//     num_interrupts = master_input_write(dev, plic_dev);
+
+//     printf("FINISHing SoftAttenM in EdgeBert...\n");
+// }
+
+// static token_t *EdgeBert_pooler(
+//     struct esp_device *dev,
+//     struct esp_device *plic_dev,
+//     token_t *mem,
+//     token_t *attention_heads,
+//     int input_m,
+//     int hidden_size
+// ) {
+//     // Weight matrix (hidden_size * hidden_size)
+//     token_t *we_mat1;
+//     token_t *mask_mat1;
+//     token_t *mask_mat2;
+
+//     // Allocate space for matrices
+//     we_mat1 = aligned_malloc(hidden_size * hidden_size * sizeof(int));
+//     // QUESTION: mask_mat?
+
+//     // Fill with data
+//     EdgeBert_init_buf_pooler(we_mat1);
+
+//     // Matrix multiplication configurations
+//     int N0;
+//     int N1;
+//     int M_mat;
+//     unsigned is_relu;
+//     int softmax;
+
+//     N0 = input_m; M_mat = hidden_size; N1 = hidden_size;
+//     is_relu = 0;
+//     softmax = 0;
+
+//     // Query multiplication
+//     general_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat1, mask_mat2, we_mat1, attention_heads, softmax);
+
+//     // Activation?
+
+//     // Get hidden states for first token
+//     int *out;
+//     out = aligned_malloc(hidden_size);
+//     memcpy(out, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, hidden_size);
+
+//     // Free allocated space
+//     aligned_free(we_mat1);
+//     return out;
+// }
+
+// static token_t *EdgeBert_highway_exit(
+//     struct esp_device *dev,
+//     struct esp_device *plic_dev,
+//     token_t *mem,
+//     token_t *attention_heads,
+//     int input_m,
+//     int hidden_size,
+//     int num_labels
+// ) {
+//     // Highway exit
+//     // Index in to layer outputs
+//     token_t *pooler_output = EdgeBert_pooler(dev, plic_dev, mem, attention_heads, input_m, hidden_size);
+
+//     // Intialize linear layer and outputs
+//     token_t *we_mat1;
+//     token_t *mask_mat1;
+//     token_t *mask_mat2;
+//     token_t *output;
+
+//     we_mat1 = aligned_malloc(N0 * M_mat);
+//     output = aligned_malloc(N0 * N1);
+
+//     // Fill with data
+//     EdgeBert_init_buf_highway(we_mat1);
+
+//     // Initialize config
+//     int N0;
+//     int N1;
+//     int M_mat;
+//     unsigned is_relu;
+//     int softmax;
+
+//     N0 = num_labels;
+//     M_mat = hidden_size;
+//     N1 = 1;
+//     is_relu = 0;
+//     softmax = 0;
+
+//     // Perform matrix multiplication
+//     general_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat1, mask_mat2, we_mat1, pooler_output, softmax);
+//     memcpy(result_mat_1, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
+
+//     aligned_free(we_mat1);
+//     aligned_free(mask_mat1);
+//     aligned_free(mask_mat2);
+
+//     return output;
+// }
+
+// // Attention head
+// static token_t *EdgeBert_attention(
+//     struct esp_device *dev,
+//     struct esp_device *plic_dev,
+//     token_t *mem,
+//     int input_m,
+//     int input_n,
+//     int hidden_size
+// ) {
+//     printf("STARTing Attention Head in EdgeBert...\n");
+
+//     int num_interrupts;
+
+//     // Initialize inputs and weights
+//     token_t *input_ids;
+//     token_t *mask_input;
+//     token_t *we_query;
+//     token_t *mask_query;
+//     token_t *we_key;
+//     token_t *mask_key;
+//     token_t *we_val;
+//     token_t *mask_val;
+//     token_t *aux_mat;
+
+//     // Initialize IDs
+//     input_ids = aligned_malloc(input_m * input_n);
+//     mask_input = aligned_malloc(ceil_div(input_m * input_n, 8));
+//     we_query = aligned_malloc(input_n * hidden_size);
+//     mask_query = aligned_malloc(ceil_div(input_n * hidden_size, 8));
+//     we_key = aligned_malloc(input_n * hidden_size);
+//     mask_key = aligned_malloc(ceil_div(input_n * hidden_size, 8));
+//     we_val = aligned_malloc(input_n * hidden_size);
+//     mask_val = aligned_malloc(ceil_div(input_n * hidden_size, 8));
+
+//     // QUESTION: Size?
+//     aux_mat = aligned_malloc(4096);
+
+//     // Initialize weights
+//     // EdgeBert_init_buf_attention(
+//     //     input_ids,
+//     //     mask_input,
+//     //     we_query,
+//     //     mask_query,
+//     //     we_key,
+//     //     mask_key,
+//     //     we_val,
+//     //     mask_val,
+//     //     aux_mat
+//     // );
+//     memset(input_ids, 11, input_m * input_n * sizeof(token_t));
+//     memset(mask_input, 255, ceil_div(input_m * input_n, 8) * sizeof(token_t));
+//     memset(we_query, 35, input_n * hidden_size * sizeof(token_t));
+//     memset(mask_query, 255, ceil_div(input_n * hidden_size, 8)* sizeof(token_t));
+//     memset(we_key, -1, input_n * hidden_size * sizeof(token_t));
+//     memset(mask_key, 255, ceil_div(input_n * hidden_size, 8) * sizeof(token_t));
+//     memset(we_val, -12, input_n * hidden_size * sizeof(token_t));
+//     memset(mask_val, 255, ceil_div(input_n * hidden_size, 8) * sizeof(token_t));
+//     memset(aux_mat, 3, 4096 * sizeof(token_t));
+
+//     // Initialize matrix multiplication
+//     unsigned N0;
+//     unsigned N1;
+//     unsigned M_mat;
+//     unsigned is_relu;
+//     int softmax;
+
+//     N0 = input_m;
+//     M_mat = input_n;
+//     N1 = hidden_size;
+//     is_relu = 0;
+//     softmax = 0;
+
+//     token_t *query_mat;
+//     token_t *mask_query_res;
+//     token_t *key_mat;
+//     token_t *mask_key_res;
+//     token_t *val_mat;
+//     token_t *mask_val_res;
+
+//     // Initialize output matrices
+//     query_mat = aligned_malloc(N0 * N1);
+//     mask_query_res = aligned_malloc();
+//     key_mat = aligned_malloc(N0 * N1);
+//     mask_key_res = aligned_malloc();
+//     val_mat = aligned_malloc(N0 * N1);
+//     mask_val_res = aligned_malloc();
+
+//     // Mutliply IDs by query matrix
+//     general_mat_mul(
+//         dev,
+//         plic_dev,
+//         N0,
+//         N1,
+//         M_mat,
+//         is_relu,
+//         mem,
+//         mask_input,
+//         mask_query,
+//         input_ids,
+//         we_query,
+//         softmax
+//     );
+//     // Save result
+//     memcpy(query_mat, mem + 2 * mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1);
+
+//     // Mutliply IDs by key matrix
+//     general_mat_mul(
+//         dev,
+//         plic_dev,
+//         N0,
+//         N1,
+//         M_mat,
+//         is_relu,
+//         mem,
+//         mask_input,
+//         mask_key,
+//         input_ids,
+//         we_key,
+//         softmax
+//     );
+//     // Save result
+//     memcpy(key_mat, mem + 2 * mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1);
+
+//     // Mutliply IDs by value matrix
+//     general_mat_mul(
+//         dev,
+//         plic_dev,
+//         N0,
+//         N1,
+//         M_mat,
+//         is_relu,
+//         mem,
+//         mask_input,
+//         mask_val,
+//         input_ids,
+//         we_val,
+//         softmax
+//     );
+//     // Save result
+//     memcpy(val_mat, mem + 2 * mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1);
+
+//     // Transpose output of key multiplication
+//     CPU_transpose(key_mat, N0, N1);
+
+//     // Matrix config
+//     N0 = input_m;
+//     M_mat = input_n;
+//     N1 = input_m;
+//     // Set softmax parameter to true
+//     softmax = 1;
+
+//     token_t *query_key_mat;
+//     query_key_mat = aligned_malloc(N0 * N1);
+
+//     // Multiply query and key outpput
+//     general_mat_mul(
+//         dev,
+//         plic_dev,
+//         N0,
+//         N1,
+//         M_mat,
+//         is_relu,
+//         mem,
+//         mask_mat,
+//         query_mat,
+//         key_mat,
+//         softmax
+//     );
+
+//     // Free memory
+//     aligned_free(query_mat);
+//     aligned_free(key_mat);
+
+//     // Softmax and attention span configuration
+//     N0 = input_m;
+//     M_mat = input_m;
+//     N1 = input_m;
+
+//     // Apply softmax
+//     EdgeBert_atten_softmax(dev, plic_dev, N0, N1, M_mat);
+//     memcpy(query_key_mat, mem + 2 * mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
+
+//     // Multiply query and key with value matrix
+//     N0 = input_m;
+//     M_mat = input_m;
+//     N1 = hidden_size;
+//     softmax = 0;
+
+//     general_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, query_key_mat, val_mat, softmax);
+//     memcpy(val_mat, mem + 2 * mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
+
+//     // Free memory
+//     aligned_free(input_ids);
+//     aligned_free(we_query);
+//     aligned_free(we_key);
+//     aligned_free(we_val);
+//     aligned_free(mask_mat);
+//     aligned_free(aux_mat);
+//     aligned_free(query_key_mat);
+
+//     printf("FINISHing Attention Head in EdgeBert...\n");
+//     return val_mat;
+// }
+
+// static token_t *EdgeBert_attention_heads(
+//     struct esp_device *dev,
+//     struct esp_device *plic_dev,
+//     token_t *mem,
+//     int num_heads,
+//     int input_m,
+//     int input_n,
+//     int hidden_size,
+//     int num_labels
+// ) {
+//     printf("STARTing EdgeBERT %d Attention Heads Computation...\n", num_heads);
+
+//     // Profiling
+//     uint64_t total_exe_cycle = 0;
+//     uint64_t count1;
+//     uint64_t count2;
+//     uint64_t exe_cycle;
+
+//     token_t* attention_heads;
+//     attention_heads = aligned_malloc(input_m * hidden_size * num_heads);
+
+//     for (int i = 0; i < 12; i++) {
+//         // Run attention head
+//         count1 = get_counter();
+//         EdgeBert_attention(
+//             dev,
+//             plic_dev,
+//             mem,
+//             input_m,
+//             input_n,
+//             hidden_size
+//         );
+//         count2 = get_counter();
+//         exe_cycle = count2 - count1;
+//         printf("...Attention Head %d takes %"PRIu64" clock cycles...\n", i, exe_cycle);
+
+//         for (int l = 0; l < input_m; l++) {
+//             for (int k = 0; k < hidden_size; k++) {
+//                 attention_heads[l * hidden_size * num_heads + i * hidden_size + k] = mem[2 * mask_buffer_size + 2 * input_buffer_size + aux_buffer_size + l * hidden_size + k];
+//             }
+//         }
+
+//         // Keep track of number of cycles
+//         total_exe_cycle = total_exe_cycle + exe_cycle;
+//     }
+
+//     printf("FINISHing EdgeBERT 12 Attention Heads Computation...\n");
+//     printf("###(%"PRIu64" clock cycles)###\n", total_exe_cycle);
+//     return attention_heads;
+// }
+
+// // Apply layer norm
+// // QUESTION: Mask?
+// static void EdgeBert_element_add_layer_norm(
+//     struct esp_device *dev,
+//     struct esp_device *plic_dev,
+//     int N0,
+//     int N1,
+//     int M_mat,
+//     token_t *mem,
+//     token_t *D_mat1,
+//     token_t *D_mat2
+// ) {
+//     unsigned data = 0;
+//     int num_interrupts;
+
+//     // Copy over data into the CPU
+//     unsigned input_rd1_base = ((unsigned) mem) + 2 * mask_buffer_size;
+//     unsigned input_rd2_base = ((unsigned) mem) + 2 * mask_buffer_size + input_buffer_size;
+//     memcpy(mem + 2 * mask_buffer_size, D_mat1, N0 * M_mat * sizeof(token_t));
+//     memcpy(mem + 2 * mask_buffer_size + input_buffer_size, D_mat2, M_mat * N1 * sizeof(token_t));
+
+//     // Perform element-wise addition on D_mat1 + D_mat2
+//     // Use SFU
+//     data = 0x1;
+//     iowrite32(dev, 0x50, data);
+//     // Set reset_mode to 0b100000'000000
+//     data = 0x800;
+//     iowrite32(dev, 0x58, data);
+//     // Set mode_config to ElemAdd
+//     data = 0x04;
+//     iowrite32(dev, 0x54, data);
+//     // Set activation config
+//     data = 0;
+//     data += num_vector;
+//     data += num_timestep << 8;
+//     data += adpbias_act1 << 16;
+//     data += adpbias_act2 << 20;
+//     data += adpbias_act3 << 24;
+//     iowrite32(dev, 0x20, data);
+
+//     // Load in first matrix
+//     data = 0x0;
+//     iowrite32(dev, 0x4C, data);
+//     // Set to decoder 0
+//     iowrite32(dev, 0x08, data);
+//     // Set act/weight data address
+//     data = input_rd1_base;
+//     iowrite32(dev, 0x30, data);
+//     // Start master input read
+//     data = 0x03;
+//     iowrite32(dev, 0x04, data);
+//     // Wait for interrupt
+//     num_interrupts = wait(plic_dev, num_interrupts);
+
+//     // Load in second matrix
+//     // Set to decoder 1
+//     data = 0x1;
+//     iowrite32(dev, 0x08, data);
+//     // Set read address
+//     data = input_rd2_base;
+//     iowrite32(dev, 0x30, data);
+//     // Start master input read
+//     data = 0x03;
+//     iowrite32(dev, 0x04, data);
+//     // Wait for interrupt
+//     num_interrupts = wait(plic_dev, num_interrupts);
+
+//     // Do the addition
+//     // Set matrix config
+//     data = 0x0;
+//     data += N0;
+//     data += N1 << 10;
+//     data += M_mat << 20;
+//     iowrite32(dev, 0x10, data);
+//     // Set base input
+//     data = 0;
+//     data += base_input0;
+//     data += base_input1 << 16;
+//     iowrite32(dev, 0x14, data);
+//     // Set offset
+//     data = 0;
+//     iowrite32(dev, 0x18, data);
+//     // Start element-wise addition
+//     data = 0xA;
+//     iowrite32(dev, 0x04, data);
+//     // Wait for interrupt
+//     num_interrupts = wait(plic_dev, num_interrupts);
+
+//     // Layer norm
+//     // Set to decoder 0
+//     data = 0x0;
+//     iowrite32(dev, 0x08, data);
+//     // Enable SFU
+//     data = 0x1;
+//     iowrite32(dev, 0x50, data);
+//     // Set reset_mode to layer norm for decoder 0
+//     data = 0x04;
+//     iowrite32(dev, 0x58, data);
+//     // Set mode to layer norm
+//     data = 0x1;
+//     iowrite32(dev, 0x54, data);
+
+//     // Set layer norm configs
+//     data = 0;
+//     data += base_attn_span;
+//     data += base_gamma << 7;
+//     data += base_beta << 15;
+//     data += adpbias_attn_span << 23;
+//     data += adpbias_gamma << 26;
+//     data += adpbias_beta << 29;
+//     iowrite32(dev, 0x1C, data);
+//     data = 0;
+//     data += num_vector;
+//     data += num_timestep << 8;
+//     data += adpbias_act1 << 16;
+//     data += adpbias_act2 << 20;
+//     data += adpbias_act3 << 24;
+//     iowrite32(dev, 0x20, data);
+//     // Set base input
+//     data = 0;
+//     data += base_input0;
+//     data += base_input1 << 16;
+//     iowrite32(dev, 0x14, data);
+//     // Set offset
+//     data = 0;
+//     iowrite32(dev, 0x18, data);
+//     // Start layer norm
+//     data = 0x8;
+//     iowrite32(dev, 0x04, data);
+//     // Wait for interrupt
+//     num_interrupts = wait(plic_dev, num_interrupts);
+
+//     // Write output to outside
+//     // Set up write to outside
+//     data = 0x1;
+//     iowrite32(dev, 0x4C, data);
+//     // Start master input write
+//     data = 0x04;
+//     iowrite32(dev, 0x04, data);
+//     // Wait for interrupt
+//     num_interrupts = wait(plic_dev, num_interrupts);
+// }
+
+// static void EdgeBert_processing(
+//     struct esp_device *dev,
+//     struct esp_device *plic_dev,
+//     token_t *mem,
+//     token_t *attention_heads,
+//     int num_heads,
+//     int input_m,
+//     int input_n,
+//     int num_labels
+// ) {
+//     printf("STARTing 12 Attention Heads Processing...\n");
+
+//     // Profiling
+//     uint64_t total_exe_cycle = 0;
+//     uint64_t count1;
+//     uint64_t count2;
+//     uint64_t exe_cycle;
+
+//     count1 = get_counter();
+//     // Multiply concatenated output (128 x 768)
+//     token_t* we_mat1;
+//     we_mat1 = aligned_malloc(768 * 768);
+//     // Fill with dummy data
+//     EdgeBert_init_buf_processing(we_mat1);
+
+//     // QUESTION: Should mask also be included in the data?
+//     token_t *mask_mat;
+//     mask_mat = aligned_malloc(8192);
+//     // Fill with dummy data
+//     memset(mask_mat, 255, 8192 * sizeof(token_t));
+
+//     // Use accelerator and split input into two
+//     token_t *input_1;
+//     token_t *input_2;
+
+//     // Matrix multiplication configurations
+//     unsigned N0;
+//     unsigned N1;
+//     unsigned M_mat;
+//     unsigned is_relu;
+
+//     N0 = 64;
+//     M_mat = 768;
+//     N1 = 64;
+//     is_relu = 0;
+
+//     input_1 = aligned_malloc(N0 * M_mat);
+//     input_2 = aligned_malloc(M_mat * N1);
+
+//     EdgeBert_init(&dev, &plic_dev, mem);
+//     int count = 0;
+//     for (int i = 0; i < 2; i++) {
+//         memcpy(input_1, attention_heads + i * N0 * M_mat, N0 * M_mat * sizeof(token_t));
+//         for (int j = 0; j < 12; j++) {
+//             memcpy(input_2, We_heads + j * M_mat * N1, M_mat * N1 * sizeof(token_t));
+
+//             if (count == 2) {
+//                 EdgeBert_init(&dev, &plic_dev, mem);
+//                 count = 0;
+//             }
+
+//             EdgeBert_mat_mul (&dev, &plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, input_1, input_2, 0);
+//             for (int l = 0; l < N0; l++) {
+//                 for (int k = 0; k < N1; k++) {
+//                     attention_head_out[(l + i * N0) * 768 + j * N1 + k] = mem[mask_buffer_size + 2 * input_buffer_size + aux_buffer_size + k + l * N0];
+//                 }
+//             }
+//             count++;
+//         }
+//     }
+
+//     aligned_free(input_1);
+//     aligned_free(input_2);
+
+//     N0 = 64;
+//     M_mat = 768;
+//     N1 = 64;
+
+//     token_t* attention_out;
+//     input_1 = aligned_malloc(N0 * M_mat);
+//     input_2  = aligned_malloc(M_mat * N1);
+
+//     // Add on input IDs and layer norm
+//     token_t* input_ids;
+//     input_ids = aligned_malloc(128 * 768);
+//     memset(input_ids, -1, 128 * 768 * sizeof(token_t));
+//     CPU_transpose(input_ids, 768, 128);
+//     attention_out = aligned_malloc(128 * 768);
+
+//     for (int i = 0; i < 2; i++) {
+//         // Split 128 x 768 into two 64 x 768
+//         memcpy(input_1, attention_head_out + i * N0 * M_mat, N0 * M_mat * sizeof(token_t));
+//         memcpy(input_2, input_ids + i * N1 * M_mat, N1 * M_mat * sizeof(token_t));
+//         EdgeBert_init(&dev, &plic_dev, mem);
+//         EdgeBert_element_add_layer_norm(&dev, &plic_dev, N0, N1, M_mat, mem, input_1, input_2);
+//         memcpy(attention_out + i * N0 * M_mat, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * M_mat * sizeof(token_t));
+//     }
+//     count2 = get_counter();
+//     printf("FINISHing 12 Attention Heads Processing...\n");
+//     printf("###(%"PRIu64" clock cycles)###\n", count2 - count1);
+
+//     return attention_out;
+// }
+
+// // Feed forward
+// static token_t *EdgeBert_feed_forward(
+//     struct esp_device *dev,
+//     struct esp_device *plic_dev,
+//     token_t *mem,
+//     token_t *attention_head_out,
+//     int input_m,
+//     int input_n,
+//     int hidden_size_ffn
+// ) {
+//     printf("\nSTARTing EdgeBERT Feed Forward Net Computation...\n");
+//     uint64_t total_exe_cycle = 0;
+//     uint64_t count1;
+//     uint64_t count2;
+//     uint64_t exe_cycle;
+
+//     count1 = get_counter();
+//     EdgeBert_init(&dev, &plic_dev, mem);
+
+//     int softmax = 0;
+//     token_t *mask_mat;
+//     mask_mat = aligned_malloc(8192);
+//     memset(mask_mat, 255, 8192 * sizeof(token_t));
+
+//     // Initialize weights
+//     token_t* we_mat1; // 768 x 3072
+//     token_t* we_mat2; // 3072 x 768
+
+//     we_mat1 = aligned_malloc(768 * 3072);
+//     we_mat2 = aligned_malloc(768 * 3072);
+
+//     // init_buf_ffn(we_mat1, we_mat2);
+//     // Load dummy data
+//     memset(we_mat1, -1, 768 * 3072 * sizeof(token_t));
+//     memset(we_mat2, -12, 768 * 3072 * sizeof(token_t));
+
+//     // Multiply attention output by weights ((128 x 768) x (768 x 3072) = (128 x 3072))
+//     unsigned N0;
+//     unsigned N1;
+//     unsigned M_mat;
+//     unsigned is_relu;
+
+//     N0 = 64;
+//     M_mat = 768;
+//     N1 = 64;
+//     is_relu = 1;
+
+//     // Split attention output into two
+//     token_t *input_1;     // 64 x 768
+//     token_t *input_2;     // 768 x 64
+//     token_t *relu_output; // 128 x 3072
+
+//     input_1 = aligned_malloc(N0 * M_mat);
+//     input_2 = aligned_malloc(M_mat * N1);
+//     relu_output = aligned_malloc(128 * 3072);
+
+//     EdgeBert_init(dev, plic_dev, mem);
+//     int count = 0;
+
+//     for (int i = 0; i < 2; i++) {
+//         // Load in half of attention output
+//         memcpy(input_1, processing_out + i * N0 * M_mat, N0 * M_mat * sizeof(token_t));
+
+//         for (int j = 0; j < 48; j++) {
+//             // TODO: Need to transpose?
+//             memcpy(input_2, we1_mat + j * M_mat * N1, M_mat * N1 * sizeof(token_t));
+
+//             if (count == 2) {
+//                 EdgeBert_init(dev, plic_dev, mem);
+//                 count = 0;
+//             }
+//             EdgeBert_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, input_1, input_2, softmax);
+//             // memcpy(relu_output + N0 * N1 * i * j, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
+
+//             // Copy over data into relu_output
+//             for (int l = 0; l < N0; l++) {
+//                 for (int k = 0; k < N1; k++) {
+//                     relu_output[(l + i * N0) * 3072 + j * N1 + k] = mem[mask_buffer_size + 2 * input_buffer_size + aux_buffer_size + l * N0 + k];
+//                 }
+//             }
+//             count++;
+//         }
+//     }
+
+//     // Multiply relu_out with second weights ((8 x 16) x 3072) x (3072 x (16 x 48))
+//     N0 = 16;
+//     M_mat = 3072;
+//     N1 = 16;
+//     is_relu = 0;
+
+//     aligned_free(input_1);
+//     aligned_free(input_2);
+//     token_t *we2_output;
+
+//     input_1 = aligned_malloc(N0 * M_mat);
+//     input_2 = aligned_malloc(M_mat * N1);
+//     we2_output = aligned_malloc(128 * 768);
+
+//     // EdgeBert_init(dev, plic_dev, mem);
+//     count = 0;
+
+//     for (int i = 0; i < 8; i++) {
+//         memcpy(input_1, relu_output + i * N0 * M_mat, N0 * M_mat * sizeof(token_t));
+
+//         for (int j = 0; j < 48; j++) {
+//             memcpy(input_2, we2_mat + j * M_mat * N1, M_mat * N1 * sizeof(token_t));
+
+//             if (count == 2) {
+//                 // EdgeBert_init(dev, plic_dev, mem);
+//                 count = 0;
+//             }
+
+//             EdgeBert_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, input_1, input_2, softmax);
+//             // memcpy(we2_output + N0 * N1 * i * j, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
+
+//             for (int l = 0; l < N0; l++) {
+//                 for (int k = 0; k < N1; k++) {
+//                     we2_output[(l + i * N0) * 768 + j * N1 + k] = mem[mask_buffer_size + 2 * input_buffer_size + aux_buffer_size + l * N0 + k];
+//                 }
+//             }
+//             count++;
+//         }
+//     }
+
+//     aligned_free(input_1);
+//     aligned_free(input_2);
+
+//     N0 = 64;
+//     M_mat = 768;
+//     N1 = 64;
+
+//     // Add attention output
+//     token_t* FFN_output;
+//     input_1 = aligned_malloc(N0 * M_mat);
+//     input_2  = aligned_malloc(M_mat * N1);
+//     CPU_transpose(processing_out, 768, 128);
+//     FFN_output = aligned_malloc(128*768);
+
+//     for (int i = 0; i < 2; i++) {
+//         // Add parts of attention output
+//         memcpy(input_1, we2_output + i * N0 * M_mat, N0 * M_mat * sizeof(token_t));
+//         memcpy(input_2, processing_out + i * N1 * M_mat, N1 * M_mat * sizeof(token_t));
+//         EdgeBert_init(dev, plic_dev, mem);
+//         EdgeBert_ElementAddLayerNorm(dev, plic_dev, N0, N1, M_mat, mem, input_1, input_2);
+//         memcpy(FFN_output + i * N0 * M_mat, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * M_mat * sizeof(token_t));
+//     }
+
+//     // Free memory
+//     aligned_free(input_1);
+//     aligned_free(input_2);
+//     aligned_free(we2_output);
+//     aligned_free(mask_mat);
+//     aligned_free(we1_mat);
+//     aligned_free(we2_mat);
+//     aligned_free(relu_output);
+
+//     count2 = get_counter();
+//     printf("FINISHing EdgeBERT Feed Forward Net Computation...\n");
+//     printf("###(taking %"PRIu64" clock cycles)###...\n", count2 - count1);
+// }
+
+// static void EdgeBert_transformer(
+//     struct esp_device *dev,
+//     struct esp_device *plic_dev,
+//     token_t *mem,
+//     int num_heads,
+//     int input_m,
+//     int input_n,
+//     int hidden_size,
+//     int num_labels,
+//     int hidden_size_ffn
+// ) {
+//     printf("Transformer Matmul Performance on EdgeBERT BEGIN...\n");
+//     // Attention heads
+//     printf("\n");
+//     token_t *attention_heads = EdgeBert_attention_heads(
+//         dev,
+//         plic_dev,
+//         mem,
+//         num_heads,
+//         input_m,
+//         input_n,
+//         hidden_size,
+//         num_labels
+//     );
+
+//     // Processing
+//     printf("\n");
+//     token_t *attention_head_out = EdgeBert_processing(
+//         dev,
+//         plic_dev,
+//         mem,
+//         attention_heads,
+//         num_heads,
+//         input_m,
+//         input_n,
+//         hidden_size
+//     );
+
+//     // Feed Forward Neural Net
+//     printf("\n");
+//     token_t *out = EdgeBert_feed_forward(
+//         dev,
+//         plic_dev,
+//         mem,
+//         attention_head_out,
+//         input_m,
+//         input_n,
+//         hidden_size_ffn
+//     );
+
+//     aligned_free(out);
+
+//     printf("Transformer Matmul Performance on EdgeBERT FINISH...\n");
+//     printf("Thank you!\n");
+// }
+
+static void EdgeBert_debugging(
     struct esp_device *dev,
     struct esp_device *plic_dev,
-    int N0,
-    int N1,
-    int M_mat,
-    int is_relu,
-    token_t *mem,
-    token_t *mask_mat1,
-    token_t *mask_mat2,
-    token_t *D_mat1,
-    token_t *D_mat2,
-    int softmax
+    token_t *mem
 ) {
-    // TODO: Add another mask_mat argument
-    // TODO: Deal with masks
-    unsigned N0_tile;
-    unsigned N1_tile;
+    printf("hello, world\n");
+    int num_interrupts = 0;
 
-    // Try to get as many columns
-    N1_tile = input_buffer_size / M_mat;
-    N0_tile = input_buffer_size / (M_mat + N1_tile);
-
-    // Assume that at least one row and output can fit
-    assert(N0_tile != 0);
-    EdgeBert_init(dev, plic_dev, mem);
-
-    // Allocate memory for matrices
-    token_t *left;
-    token_t *right;
-    token_t *output;
-
-    left = aligned_malloc(N0_tile * M_mat);
-    right = aligned_malloc(M_mat * N1_tile);
-    output = aligned_malloc(N0 * N1);
-
-    // Tranpose for easier access
-    CPU_transpose(D_mat2, M_mat, N1);
-
-    int count = 0;
-    int row = 0, col = 0;
-    while (row < N0) {
-        // Get left matrix
-        unsigned N0_mat = min(N0_tile, N0 - row);
-        memcpy(left, D_mat1 + M_mat * row, N0_mat * M_mat * sizeof(token_t));
-        while (col < N1) {
-            // Get right matrix
-            unsigned N1_mat = min(N1_tile, N1 - col);
-            memcpy(right, D_mat + M_mat * col, N1_mat * M_mat * sizeof(token_t));
-            CPU_transpose(right, N1_mat, M_mat);
-
-            // Multiply
-            EdgeBert_mat_mul(dev, plic_dev, N0_mat, N1_mat, M_mat, is_relu, mem, mask_mat, left, right, softmax);
-
-            // Copy over data into relu_output
-            for (int l = 0; l < N0_mat; l++) {
-                for (int k = 0; k < N1_mat; k++) {
-                    relu_output[(row + l) * N1 + col + k] = mem[mask_buffer_size + 2 * input_buffer_size + aux_buffer_size + l * N0_mat + k];
-                }
-            }
-            col += N1_mat;
-            count++;
-        }
-        row += N0_mat;
-    }
-}
-
-// QUESTION: Softmax if the whole row cannot fit?
-// Softmax for attention head
-static void EdgeBert_atten_softmax(
-    struct esp_device *dev,
-    struct esp_device *plic_dev,
-    int N0,
-    int N1,
-    int M_mat
-) {
-    printf("STARTing attention softmax in EdgeBert...\n");
-    unsigned data = 0;
-    int num_interrupts;
-
-    // Calculate softmax
-    // Set use_gb and reset_mode
-    // Choose decoder 0
-    data = 0x0;
-    iowrite32(dev, 0x08, data);
-    // Set SFU to true
-    data = 0x1;
-    iowrite32(dev, 0x50, data);
-    // Set softmax for decoder 0
-    data = 0x08;
-    iowrite32(dev, 0x58, data);
-    // Set mode to softmax
-    data = 0x02;
-    iowrite32(dev, 0x54, data);
-    // Configure parameters
-    data = 0;
-    data += base_attn_span;
-    data += base_gamma << 7;
-    data += base_beta << 15;
-    data += adpbias_attn_span << 23;
-    data += adpbias_gamma << 26;
-    data += adpbias_beta << 29;
-    iowrite32(dev, 0x1C, data);
-    data = 0;
-    data += num_vector;
-    data += num_timestep << 8;
-    data += adpbias_act1 << 16;
-    data += adpbias_act2 << 20;
-    data += adpbias_act3 << 24;
-    iowrite32(dev, 0x20, data);
-    // Configure matrix size
-    data = 0x0;
-    data += N0;
-    data += N1 << 10;
-    data += M_mat << 20;
-    iowrite32(dev, 0x10, data);
-    // Set base of matrix
-    data = 0;
-    data += base_input0;
-    data += base_input1 << 16;
-    iowrite32(dev, 0x14, data);
-    // Set offset
-    data = 0;
-    iowrite32(dev, 0x18, data);
-    // Set to decoder 0
-    data = 0x0;
-    iowrite32(dev, 0x08, data);
-    // Start softmax
-    data = 0x9;
-    iowrite32(dev, 0x04, data);
-    // Wait for interrupt
-    num_interrupts = wait(plic_dev, num_interrupts);
-
-    // Master input write (load from accelerator DATA scratchpad and store outside)
-    // Read data to store outside
-    data = 0x1;
-    iowrite32(dev, 0x4C, data);
-    // Start input master write
-    data = 0x04;
-    iowrite32(dev, 0x04, data);
-    // Wait for interrupt
-    num_interrupts = wait(plic_dev, num_interrupts);
-
-    printf("FINISHing SoftAttenM in EdgeBert...\n");
-}
-
-static token_t *EdgeBert_pooler(
-    struct esp_device *dev,
-    struct esp_device *plic_dev,
-    token_t *mem,
-    token_t* attention_heads,
-    int input_m,
-    int hidden_size
-) {
-    // Weight matrix (hidden_size * hidden_size)
+    // Initialize weights
     token_t *we_mat1;
+    token_t *input;
     token_t *mask_mat1;
-    token_t *mask_mat2;
-
-    // Allocate space for matrices
-    we_mat1 = aligned_malloc(hidden_size * hidden_size * sizeof(int));
-    // QUESTION: mask_mat?
-
-    // Fill with data
-    EdgeBert_init_buf_pooler(we_mat1);
-
-    // Matrix multiplication configurations
-    int N0;
-    int N1;
-    int M_mat;
-    unsigned is_relu;
-    int softmax;
-
-    N0 = input_m; M_mat = hidden_size; N1 = hidden_size;
-    is_relu = 0;
-    softmax = 0;
-
-    // Query multiplication
-    general_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat1, mask_mat2, we_mat1, attention_heads, softmax);
-
-    // Activation?
-
-    // Get hidden states for first token
-    int *out;
-    out = aligned_malloc(hidden_size);
-    memcpy(out, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, hidden_size);
-
-    // Free allocated space
-    aligned_free(we_mat1);
-    return out;
-}
-
-static token_t *EdgeBert_highway_exit(
-    struct esp_device *dev,
-    struct esp_device *plic_dev,
-    token_t *mem,
-    token_t *attention_heads,
-    int input_m,
-    int hidden_size,
-    int num_labels
-) {
-    // Highway exit
-    // Index in to layer outputs
-    token_t *pooler_output = EdgeBert_pooler(dev, plic_dev, mem, attention_heads, input_m, hidden_size);
-
-    // Intialize linear layer and outputs
-    token_t *we_mat1;
-    token_t *mask_mat1;
-    token_t *mask_mat2;
-    token_t *output;
-
-    we_mat1 = aligned_malloc(N0 * M_mat);
-    output = aligned_malloc(N0 * N1);
-
-    // Fill with data
-    EdgeBert_init_buf_highway(we_mat1);
-
-    // Initialize config
-    int N0;
-    int N1;
-    int M_mat;
-    unsigned is_relu;
-    int softmax;
-
-    N0 = num_labels;
-    M_mat = hidden_size;
-    N1 = 1;
-    is_relu = 0;
-    softmax = 0;
-
-    // Perform matrix multiplication
-    general_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat1, mask_mat2, we_mat1, pooler_output, softmax);
-    memcpy(result_mat_1, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
-
-    aligned_free(we_mat1);
-    aligned_free(mask_mat1);
-    aligned_free(mask_mat2);
-
-    return output;
-}
-
-// QUESTION?
-// Attention head
-static token_t *EdgeBert_attention(
-    struct esp_device *dev,
-    struct esp_device *plic_dev,
-    token_t *mem,
-    int input_m,
-    int input_n,
-    int hidden_size
-) {
-    printf("STARTing Attention Head in EdgeBert...\n");
-
-    int num_interrupts;
-
-    // Initialize inputs and weights
-    token_t *input_ids;
     token_t *mask_input;
-    token_t *we_query;
-    token_t *mask_query;
-    token_t *we_key;
-    token_t *mask_key;
-    token_t *we_val;
-    token_t *mask_val;
-    token_t *aux_mat;
+    token_t *output;
+    token_t *mask_output;
 
-    // Initialize IDs
-    input_ids = aligned_malloc(input_m * input_n);
-    mask_input = aligned_malloc(ceil_div(input_m * input_n, 8));
-    we_query = aligned_malloc(input_n * hidden_size);
-    mask_query = aligned_malloc(ceil_div(input_n * hidden_size, 8));
-    we_key = aligned_malloc(input_n * hidden_size);
-    mask_key = aligned_malloc(ceil_div(input_n * hidden_size, 8));
-    we_val = aligned_malloc(input_n * hidden_size);
-    mask_val = aligned_malloc(ceil_div(input_n * hidden_size, 8));
+    we_mat1 = aligned_malloc(8 * 4);
+    input = aligned_malloc(4 * 4);
+    mask_mat1 = aligned_malloc(4);
+    mask_input = aligned_malloc(2);
+    output = aligned_malloc(4 * 8);
+    mask_output = aligned_malloc(4);
 
-    // QUESTION: Size?
-    aux_mat = aligned_malloc(4096);
-
-    // Initialize weights
-    // EdgeBert_init_buf_attention(
-    //     input_ids,
-    //     mask_input,
-    //     we_query,
-    //     mask_query,
-    //     we_key,
-    //     mask_key,
-    //     we_val,
-    //     mask_val,
-    //     aux_mat
-    // );
-    memset(input_ids, 11, input_m * input_n * sizeof(token_t));
-    memset(mask_input, 255, ceil_div(input_m * input_n, 8) * sizeof(token_t));
-    memset(we_query, 35, input_n * hidden_size * sizeof(token_t));
-    memset(mask_query, 255, ceil_div(input_n * hidden_size, 8)* sizeof(token_t));
-    memset(we_key, -1, input_n * hidden_size * sizeof(token_t));
-    memset(mask_key, 255, ceil_div(input_n * hidden_size, 8) * sizeof(token_t));
-    memset(we_val, -12, input_n * hidden_size * sizeof(token_t));
-    memset(mask_val, 255, ceil_div(input_n * hidden_size, 8) * sizeof(token_t));
-    memset(aux_mat, 3, 4096 * sizeof(token_t));
-
-    // Initialize matrix multiplication
-    unsigned N0;
-    unsigned N1;
-    unsigned M_mat;
-    unsigned is_relu;
-    int softmax;
-
-    N0 = input_m;
-    M_mat = input_n;
-    N1 = hidden_size;
-    is_relu = 0;
-    softmax = 0;
-
-    token_t *query_mat;
-    token_t *mask_query_res;
-    token_t *key_mat;
-    token_t *mask_key_res;
-    token_t *val_mat;
-    token_t *mask_val_res;
-
-    // Initialize output matrices
-    query_mat = aligned_malloc(N0 * N1);
-    mask_query_res = aligned_malloc();
-    key_mat = aligned_malloc(N0 * N1);
-    mask_key_res = aligned_malloc();
-    val_mat = aligned_malloc(N0 * N1);
-    mask_val_res = aligned_malloc();
-
-    // Mutliply IDs by query matrix
-    general_mat_mul(
-        dev,
-        plic_dev,
-        N0,
-        N1,
-        M_mat,
-        is_relu,
-        mem,
-        mask_input,
-        mask_query,
-        input_ids,
-        we_query,
-        softmax
-    );
-    // Save result
-    memcpy(query_mat, mem + 2 * mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1);
-
-    // Mutliply IDs by key matrix
-    general_mat_mul(
-        dev,
-        plic_dev,
-        N0,
-        N1,
-        M_mat,
-        is_relu,
-        mem,
-        mask_input,
-        mask_key,
-        input_ids,
-        we_key,
-        softmax
-    );
-    // Save result
-    memcpy(key_mat, mem + 2 * mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1);
-
-    // Mutliply IDs by value matrix
-    general_mat_mul(
-        dev,
-        plic_dev,
-        N0,
-        N1,
-        M_mat,
-        is_relu,
-        mem,
-        mask_input,
-        mask_val,
-        input_ids,
-        we_val,
-        softmax
-    );
-    // Save result
-    memcpy(val_mat, mem + 2 * mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1);
-
-    // Transpose output of key multiplication
-    CPU_transpose(key_mat, N0, N1);
-
-    // Matrix config
-    N0 = input_m;
-    M_mat = input_n;
-    N1 = input_m;
-    // Set softmax parameter to true
-    softmax = 1;
-
-    token_t *query_key_mat;
-    query_key_mat = aligned_malloc(N0 * N1);
-
-    // Multiply query and key outpput
-    general_mat_mul(
-        dev,
-        plic_dev,
-        N0,
-        N1,
-        M_mat,
-        is_relu,
-        mem,
-        mask_mat,
-        query_mat,
-        key_mat,
-        softmax
-    );
-
-    // Free memory
-    aligned_free(query_mat);
-    aligned_free(key_mat);
-
-    // Softmax and attention span configuration
-    N0 = input_m;
-    M_mat = input_m;
-    N1 = input_m;
-
-    // Apply softmax
-    EdgeBert_atten_softmax(dev, plic_dev, N0, N1, M_mat);
-    memcpy(query_key_mat, mem + 2 * mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
-
-    // Multiply query and key with value matrix
-    N0 = input_m;
-    M_mat = input_m;
-    N1 = hidden_size;
-    softmax = 0;
-
-    general_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, query_key_mat, val_mat, softmax);
-    memcpy(val_mat, mem + 2 * mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
-
-    // Free memory
-    aligned_free(input_ids);
-    aligned_free(we_query);
-    aligned_free(we_key);
-    aligned_free(we_val);
-    aligned_free(mask_mat);
-    aligned_free(aux_mat);
-    aligned_free(query_key_mat);
-
-    printf("FINISHing Attention Head in EdgeBert...\n");
-    return val_mat;
-}
-
-static token_t *EdgeBert_attention_heads(
-    struct esp_device *dev,
-    struct esp_device *plic_dev,
-    token_t *mem,
-    int num_heads,
-    int input_m,
-    int input_n,
-    int hidden_size,
-    int num_labels
-) {
-    printf("STARTing EdgeBERT %d Attention Heads Computation...\n", num_heads);
-
-    // Profiling
-    uint64_t total_exe_cycle = 0;
-    uint64_t count1;
-    uint64_t count2;
-    uint64_t exe_cycle;
-
-    token_t* attention_heads;
-    attention_heads = aligned_malloc(input_m * hidden_size * num_heads);
-
-    for (int i = 0; i < 12; i++) {
-        // Run attention head
-        count1 = get_counter();
-        EdgeBert_attention(
-            dev,
-            plic_dev,
-            mem,
-            input_m,
-            input_n,
-            hidden_size
-        );
-        count2 = get_counter();
-        exe_cycle = count2 - count1;
-        printf("...Attention Head %d takes %"PRIu64" clock cycles...\n", i, exe_cycle);
-
-        for (int l = 0; l < input_m; l++) {
-            for (int k = 0; k < hidden_size; k++) {
-                attention_heads[l * hidden_size * num_heads + i * hidden_size + k] = mem[2 * mask_buffer_size + 2 * input_buffer_size + aux_buffer_size + l * hidden_size + k];
-            }
-        }
-
-        // Keep track of number of cycles
-        total_exe_cycle = total_exe_cycle + exe_cycle;
-    }
-
-    printf("FINISHing EdgeBERT 12 Attention Heads Computation...\n");
-    printf("###(%"PRIu64" clock cycles)###\n", total_exe_cycle);
-    return attention_heads;
-}
-
-// Apply layer norm
-// QUESTION: Mask?
-static void EdgeBert_element_add_layer_norm(
-    struct esp_device *dev,
-    struct esp_device *plic_dev,
-    int N0,
-    int N1,
-    int M_mat,
-    token_t *mem,
-    token_t *D_mat1,
-    token_t *D_mat2
-) {
-    unsigned data = 0;
-    int num_interrupts;
-
-    // Copy over data into the CPU
-    unsigned input_rd1_base = ((unsigned) mem) + 2 * mask_buffer_size;
-    unsigned input_rd2_base = ((unsigned) mem) + 2 * mask_buffer_size + input_buffer_size;
-    memcpy(mem + 2 * mask_buffer_size, D_mat1, N0 * M_mat * sizeof(token_t));
-    memcpy(mem + 2 * mask_buffer_size + input_buffer_size, D_mat2, M_mat * N1 * sizeof(token_t));
-
-    // Perform element-wise addition on D_mat1 + D_mat2
-    // Use SFU
-    data = 0x1;
-    iowrite32(dev, 0x50, data);
-    // Set reset_mode to 0b100000'000000
-    data = 0x800;
-    iowrite32(dev, 0x58, data);
-    // Set mode_config to ElemAdd
-    data = 0x04;
-    iowrite32(dev, 0x54, data);
-    // Set activation config
-    data = 0;
-    data += num_vector;
-    data += num_timestep << 8;
-    data += adpbias_act1 << 16;
-    data += adpbias_act2 << 20;
-    data += adpbias_act3 << 24;
-    iowrite32(dev, 0x20, data);
-
-    // Load in first matrix
-    data = 0x0;
-    iowrite32(dev, 0x4C, data);
-    // Set to decoder 0
-    iowrite32(dev, 0x08, data);
-    // Set act/weight data address
-    data = input_rd1_base;
-    iowrite32(dev, 0x30, data);
-    // Start master input read
-    data = 0x03;
-    iowrite32(dev, 0x04, data);
-    // Wait for interrupt
-    num_interrupts = wait(plic_dev, num_interrupts);
-
-    // Load in second matrix
-    // Set to decoder 1
-    data = 0x1;
-    iowrite32(dev, 0x08, data);
-    // Set read address
-    data = input_rd2_base;
-    iowrite32(dev, 0x30, data);
-    // Start master input read
-    data = 0x03;
-    iowrite32(dev, 0x04, data);
-    // Wait for interrupt
-    num_interrupts = wait(plic_dev, num_interrupts);
-
-    // Do the addition
-    // Set matrix config
-    data = 0x0;
-    data += N0;
-    data += N1 << 10;
-    data += M_mat << 20;
-    iowrite32(dev, 0x10, data);
-    // Set base input
-    data = 0;
-    data += base_input0;
-    data += base_input1 << 16;
-    iowrite32(dev, 0x14, data);
-    // Set offset
-    data = 0;
-    iowrite32(dev, 0x18, data);
-    // Start element-wise addition
-    data = 0xA;
-    iowrite32(dev, 0x04, data);
-    // Wait for interrupt
-    num_interrupts = wait(plic_dev, num_interrupts);
-
-    // Layer norm
-    // Set to decoder 0
-    data = 0x0;
-    iowrite32(dev, 0x08, data);
-    // Enable SFU
-    data = 0x1;
-    iowrite32(dev, 0x50, data);
-    // Set reset_mode to layer norm for decoder 0
-    data = 0x04;
-    iowrite32(dev, 0x58, data);
-    // Set mode to layer norm
-    data = 0x1;
-    iowrite32(dev, 0x54, data);
-
-    // Set layer norm configs
-    data = 0;
-    data += base_attn_span;
-    data += base_gamma << 7;
-    data += base_beta << 15;
-    data += adpbias_attn_span << 23;
-    data += adpbias_gamma << 26;
-    data += adpbias_beta << 29;
-    iowrite32(dev, 0x1C, data);
-    data = 0;
-    data += num_vector;
-    data += num_timestep << 8;
-    data += adpbias_act1 << 16;
-    data += adpbias_act2 << 20;
-    data += adpbias_act3 << 24;
-    iowrite32(dev, 0x20, data);
-    // Set base input
-    data = 0;
-    data += base_input0;
-    data += base_input1 << 16;
-    iowrite32(dev, 0x14, data);
-    // Set offset
-    data = 0;
-    iowrite32(dev, 0x18, data);
-    // Start layer norm
-    data = 0x8;
-    iowrite32(dev, 0x04, data);
-    // Wait for interrupt
-    num_interrupts = wait(plic_dev, num_interrupts);
-
-    // Write output to outside
-    // Set up write to outside
-    data = 0x1;
-    iowrite32(dev, 0x4C, data);
-    // Start master input write
-    data = 0x04;
-    iowrite32(dev, 0x04, data);
-    // Wait for interrupt
-    num_interrupts = wait(plic_dev, num_interrupts);
-}
-
-static void EdgeBert_processing(
-    struct esp_device *dev,
-    struct esp_device *plic_dev,
-    token_t *mem,
-    token_t *attention_heads,
-    int num_heads,
-    int input_m,
-    int input_n,
-    int num_labels
-) {
-    printf("STARTing 12 Attention Heads Processing...\n");
-
-    // Profiling
-    uint64_t total_exe_cycle = 0;
-    uint64_t count1;
-    uint64_t count2;
-    uint64_t exe_cycle;
-
-    count1 = get_counter();
-    // Multiply concatenated output (128 x 768)
-    token_t* we_mat1;
-    we_mat1 = aligned_malloc(768 * 768);
-    // Fill with dummy data
-    EdgeBert_init_buf_processing(we_mat1);
-
-    // QUESTION: Should mask also be included in the data?
-    token_t *mask_mat;
-    mask_mat = aligned_malloc(8192);
-    // Fill with dummy data
-    memset(mask_mat, 255, 8192 * sizeof(token_t));
-
-    // Use accelerator and split input into two
-    token_t *input_1;
-    token_t *input_2;
-
-    // Matrix multiplication configurations
-    unsigned N0;
-    unsigned N1;
-    unsigned M_mat;
-    unsigned is_relu;
-
-    N0 = 64;
-    M_mat = 768;
-    N1 = 64;
-    is_relu = 0;
-
-    input_1 = aligned_malloc(N0 * M_mat);
-    input_2 = aligned_malloc(M_mat * N1);
-
-    EdgeBert_init(&dev, &plic_dev, mem);
-    int count = 0;
-    for (int i = 0; i < 2; i++) {
-        memcpy(input_1, attention_heads + i * N0 * M_mat, N0 * M_mat * sizeof(token_t));
-        for (int j = 0; j < 12; j++) {
-            memcpy(input_2, We_heads + j * M_mat * N1, M_mat * N1 * sizeof(token_t));
-
-            if (count == 2) {
-                EdgeBert_init(&dev, &plic_dev, mem);
-                count = 0;
-            }
-
-            EdgeBert_mat_mul (&dev, &plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, input_1, input_2, 0);
-            for (int l = 0; l < N0; l++) {
-                for (int k = 0; k < N1; k++) {
-                    attention_head_out[(l + i * N0) * 768 + j * N1 + k] = mem[mask_buffer_size + 2 * input_buffer_size + aux_buffer_size + k + l * N0];
-                }
-            }
-            count++;
-        }
-    }
-
-    aligned_free(input_1);
-    aligned_free(input_2);
-
-    N0 = 64;
-    M_mat = 768;
-    N1 = 64;
-
-    token_t* attention_out;
-    input_1 = aligned_malloc(N0 * M_mat);
-    input_2  = aligned_malloc(M_mat * N1);
-
-    // Add on input IDs and layer norm
-    token_t* input_ids;
-    input_ids = aligned_malloc(128 * 768);
-    memset(input_ids, -1, 128 * 768 * sizeof(token_t));
-    CPU_transpose(input_ids, 768, 128);
-    attention_out = aligned_malloc(128 * 768);
-
-    for (int i = 0; i < 2; i++) {
-        // Split 128 x 768 into two 64 x 768
-        memcpy(input_1, attention_head_out + i * N0 * M_mat, N0 * M_mat * sizeof(token_t));
-        memcpy(input_2, input_ids + i * N1 * M_mat, N1 * M_mat * sizeof(token_t));
-        EdgeBert_init(&dev, &plic_dev, mem);
-        EdgeBert_element_add_layer_norm(&dev, &plic_dev, N0, N1, M_mat, mem, input_1, input_2);
-        memcpy(attention_out + i * N0 * M_mat, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * M_mat * sizeof(token_t));
-    }
-    count2 = get_counter();
-    printf("FINISHing 12 Attention Heads Processing...\n");
-    printf("###(%"PRIu64" clock cycles)###\n", count2 - count1);
-
-    return attention_out;
-}
-
-// Feed forward
-static token_t *EdgeBert_feed_forward(
-    struct esp_device *dev,
-    struct esp_device *plic_dev,
-    token_t *mem,
-    token_t *attention_head_out,
-    int input_m,
-    int input_n,
-    int hidden_size_ffn
-) {
-    printf("\nSTARTing EdgeBERT Feed Forward Net Computation...\n");
-    uint64_t total_exe_cycle = 0;
-    uint64_t count1;
-    uint64_t count2;
-    uint64_t exe_cycle;
-
-    count1 = get_counter();
-    EdgeBert_init(&dev, &plic_dev, mem);
-
-    int softmax = 0;
-    token_t *mask_mat;
-    mask_mat = aligned_malloc(8192);
-    memset(mask_mat, 255, 8192 * sizeof(token_t));
-
-    // Initialize weights
-    token_t* we_mat1; // 768 x 3072
-    token_t* we_mat2; // 3072 x 768
-
-    we_mat1 = aligned_malloc(768 * 3072);
-    we_mat2 = aligned_malloc(768 * 3072);
-
-    // init_buf_ffn(we_mat1, we_mat2);
     // Load dummy data
-    memset(we_mat1, -1, 768 * 3072 * sizeof(token_t));
-    memset(we_mat2, -12, 768 * 3072 * sizeof(token_t));
+    memset(we_mat1, 1, 8 * 4);
+    memset(input, 2, 4 * 4);
+    memset(mask_mat1, 255, 4);
+    memset(mask_input, 255, 2);
 
-    // Multiply attention output by weights ((128 x 768) x (768 x 3072) = (128 x 3072))
-    unsigned N0;
-    unsigned N1;
-    unsigned M_mat;
-    unsigned is_relu;
-
-    N0 = 64;
-    M_mat = 768;
-    N1 = 64;
-    is_relu = 1;
-
-    // Split attention output into two
-    token_t *input_1;     // 64 x 768
-    token_t *input_2;     // 768 x 64
-    token_t *relu_output; // 128 x 3072
-
-    input_1 = aligned_malloc(N0 * M_mat);
-    input_2 = aligned_malloc(M_mat * N1);
-    relu_output = aligned_malloc(128 * 3072);
-
-    EdgeBert_init(dev, plic_dev, mem);
-    int count = 0;
-
-    for (int i = 0; i < 2; i++) {
-        // Load in half of attention output
-        memcpy(input_1, processing_out + i * N0 * M_mat, N0 * M_mat * sizeof(token_t));
-
-        for (int j = 0; j < 48; j++) {
-            // TODO: Need to transpose?
-            memcpy(input_2, we1_mat + j * M_mat * N1, M_mat * N1 * sizeof(token_t));
-
-            if (count == 2) {
-                EdgeBert_init(dev, plic_dev, mem);
-                count = 0;
-            }
-            EdgeBert_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, input_1, input_2, softmax);
-            // memcpy(relu_output + N0 * N1 * i * j, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
-
-            // Copy over data into relu_output
-            for (int l = 0; l < N0; l++) {
-                for (int k = 0; k < N1; k++) {
-                    relu_output[(l + i * N0) * 3072 + j * N1 + k] = mem[mask_buffer_size + 2 * input_buffer_size + aux_buffer_size + l * N0 + k];
-                }
-            }
-            count++;
-        }
-    }
-
-    // Multiply relu_out with second weights ((8 x 16) x 3072) x (3072 x (16 x 48))
-    N0 = 16;
-    M_mat = 3072;
-    N1 = 16;
-    is_relu = 0;
-
-    aligned_free(input_1);
-    aligned_free(input_2);
-    token_t *we2_output;
-
-    input_1 = aligned_malloc(N0 * M_mat);
-    input_2 = aligned_malloc(M_mat * N1);
-    we2_output = aligned_malloc(128 * 768);
-
-    // EdgeBert_init(dev, plic_dev, mem);
-    count = 0;
+    printf("pre output\n");
 
     for (int i = 0; i < 8; i++) {
-        memcpy(input_1, relu_output + i * N0 * M_mat, N0 * M_mat * sizeof(token_t));
-
-        for (int j = 0; j < 48; j++) {
-            memcpy(input_2, we2_mat + j * M_mat * N1, M_mat * N1 * sizeof(token_t));
-
-            if (count == 2) {
-                // EdgeBert_init(dev, plic_dev, mem);
-                count = 0;
-            }
-
-            EdgeBert_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, input_1, input_2, softmax);
-            // memcpy(we2_output + N0 * N1 * i * j, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
-
-            for (int l = 0; l < N0; l++) {
-                for (int k = 0; k < N1; k++) {
-                    we2_output[(l + i * N0) * 768 + j * N1 + k] = mem[mask_buffer_size + 2 * input_buffer_size + aux_buffer_size + l * N0 + k];
-                }
-            }
-            count++;
+        for (int j = 0; j < 8; j++) {
+            printf("%d\n", mem[2 * mask_buffer_size + 2 * input_buffer_size + aux_buffer_size + i * 4 + j]);
         }
     }
 
-    aligned_free(input_1);
-    aligned_free(input_2);
-
-    N0 = 64;
-    M_mat = 768;
-    N1 = 64;
-
-    // Add attention output
-    token_t* FFN_output;
-    input_1 = aligned_malloc(N0 * M_mat);
-    input_2  = aligned_malloc(M_mat * N1);
-    CPU_transpose(processing_out, 768, 128);
-    FFN_output = aligned_malloc(128*768);
-
-    for (int i = 0; i < 2; i++) {
-        // Add parts of attention output
-        memcpy(input_1, we2_output + i * N0 * M_mat, N0 * M_mat * sizeof(token_t));
-        memcpy(input_2, processing_out + i * N1 * M_mat, N1 * M_mat * sizeof(token_t));
-        EdgeBert_init(dev, plic_dev, mem);
-        EdgeBert_ElementAddLayerNorm(dev, plic_dev, N0, N1, M_mat, mem, input_1, input_2);
-        memcpy(FFN_output + i * N0 * M_mat, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * M_mat * sizeof(token_t));
+    EdgeBert_init(dev, plic_dev, mem);
+    
+    printf("we_mat1\n");
+    for (int i = 0; i < 8; i++) {
+        for (int j = 0; j < 4; j++) {
+            printf("%d\n", we_mat1[i * 4 + j]);
+        }
     }
 
-    // Free memory
-    aligned_free(input_1);
-    aligned_free(input_2);
-    aligned_free(we2_output);
-    aligned_free(mask_mat);
-    aligned_free(we1_mat);
-    aligned_free(we2_mat);
-    aligned_free(relu_output);
+    printf("input\n");
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            printf("%d\n", input[i * 4 + j]);
+        }
+    }
 
-    count2 = get_counter();
-    printf("FINISHing EdgeBERT Feed Forward Net Computation...\n");
-    printf("###(taking %"PRIu64" clock cycles)###...\n", count2 - count1);
-}
+    unsigned mask_rd1_base = ((uintptr_t) mem);
+    unsigned mask_rd2_base = ((uintptr_t) mem) + mask_buffer_size;
+    unsigned input_rd1_base = ((uintptr_t) mem) + 2 * mask_buffer_size;
+    unsigned input_rd2_base = ((uintptr_t) mem) + 2 * mask_buffer_size + input_buffer_size;
+    unsigned aux_rd_base = ((uintptr_t) mem) + 2 * mask_buffer_size + 2 * input_buffer_size;
+    unsigned input_wr_base = ((uintptr_t) mem) + 2 * mask_buffer_size + 2 * input_buffer_size + aux_buffer_size;
+    unsigned mask_wr_base = ((uintptr_t) mem) + 2 * mask_buffer_size + 3 * input_buffer_size + aux_buffer_size;
 
-static void EdgeBert_transformer(
-    struct esp_device *dev,
-    struct esp_device *plic_dev,
-    token_t *mem,
-    int num_heads,
-    int input_m,
-    int input_n,
-    int hidden_size,
-    int num_labels,
-    int hidden_size_ffn
-) {
-    printf("Transformer Matmul Performance on EdgeBERT BEGIN...\n");
-    // Attention heads
-    printf("\n");
-    token_t *attention_heads = EdgeBert_attention_heads(
-        dev,
-        plic_dev,
-        mem,
-        num_heads,
-        input_m,
-        input_n,
-        hidden_size,
-        num_labels
-    );
+    memcpy(mem, mask_mat1, 4);
+    memcpy(mem + mask_buffer_size, mask_input, 2);
+    memcpy(mem + 2 * mask_buffer_size, we_mat1, 8 * 4);
+    memcpy(mem + 2 * mask_buffer_size + input_buffer_size, input, 4 * 4);
 
-    // Processing
-    printf("\n");
-    token_t *attention_head_out = EdgeBert_processing(
-        dev,
-        plic_dev,
-        mem,
-        attention_heads,
-        num_heads,
-        input_m,
-        input_n,
-        hidden_size
-    );
+    unsigned data = 0;
+    data += base_input0;
+    data += base_input1 << 16;
+    iowrite32(dev, 0x14, data);
+    data = 0;
+    iowrite32(dev, 0x18, data);
 
-    // Feed Forward Neural Net
-    printf("\n");
-    token_t *out = EdgeBert_feed_forward(
-        dev,
-        plic_dev,
-        mem,
-        attention_head_out,
-        input_m,
-        input_n,
-        hidden_size_ffn
-    );
+    int M = 2;
+    num_interrupts = master_mask_read(dev, plic_dev, mask_rd1_base, 0x0, M, num_interrupts);
+    M = 1;
+    num_interrupts = master_mask_read(dev, plic_dev, mask_rd2_base, 0x1, M, num_interrupts);
 
-    aligned_free(out);
+    M = 16;
+    num_interrupts = master_input_read(dev, plic_dev, input_rd1_base, 0x0, M, num_interrupts);
+    M = 8;
+    num_interrupts = master_input_read(dev, plic_dev, input_rd2_base, 0x1, M, num_interrupts);
 
-    printf("Transformer Matmul Performance on EdgeBERT FINISH...\n");
-    printf("Thank you!\n");
+    // M = 2;
+    // unsigned data = 0;
+    // iowrite32(dev, 0x48, data);
+    // num_interrupts = master_mask_write(dev, plic_dev, M, num_interrupts);
+
+    printf("pre output\n");
+
+    for (int i = 0; i < 8; i++) {
+        for (int j = 0; j < 8; j++) {
+            printf("%d\n", mem[2 * mask_buffer_size + 2 * input_buffer_size + aux_buffer_size + i * 4 + j]);
+        }
+    }
+
+    // M = 2;
+    // num_interrupts = master_input_write(dev, plic_dev, M, num_interrupts);
+
+    // printf("output\n");
+
+    // for (int i = 0; i < 8; i++) {
+    //     for (int j = 0; j < 8; j++) {
+    //         printf("%d\n", mem[2 * mask_buffer_size + 2 * input_buffer_size + aux_buffer_size + i * 4 + j]);
+    //     }
+    // }
+
+    // for (int i = 0; i < 8; i++) {
+    //     printf("%d\n", mem[2 * mask_buffer_size + 3 * input_buffer_size + aux_buffer_size + i]);
+    // }
+
+    data = 0;
+    data += 0;
+    data += is_bias << 4;
+    data += weight_bias << 8;
+    data += adf_accum_bias << 16;
+    data += accum_right_shift << 20;
+    iowrite32(dev, 0x0C, data);
+
+    int N0 = 8, M_mat = 4, N1 = 4;
+    num_interrupts = mat_mul(dev, plic_dev, N0, M_mat, N1, num_interrupts);
+
+    // Ideas
+    // Change mode?
+    // Need to change the vector_size
+    // Trying reading and writing different numbers
+
+    // Select decoder
+    data = 0x0;
+    iowrite32(dev, 0x08, data);
+
+    M = 2;
+    num_interrupts = master_mask_write(dev, plic_dev, M, num_interrupts);
+    
+    // M = N0 * N1 / 2;
+    // num_interrupts = master_input_write(dev, plic_dev, M, num_interrupts);
+
+    printf("matmul output\n");
+
+    for (int i = 0; i < 8; i++) {
+        for (int j = 0; j < 8; j++) {
+            printf("%d\n", mem[2 * mask_buffer_size + 2 * input_buffer_size + aux_buffer_size + i * 8 + j]);
+        }
+    }
+
+    // for (int i = 0; i < 8; i++) {
+    //     printf("%d\n", mem[2 * mask_buffer_size + 3 * input_buffer_size + aux_buffer_size + i]);
+    // }
+    
+    aligned_free(we_mat1);
+    aligned_free(input);
+    aligned_free(mask_mat1);
+    aligned_free(mask_input);
+    aligned_free(output);
+    aligned_free(mask_output);
 }
 
 // Driver
@@ -1990,13 +2200,13 @@ int main(int argc, char * argv[]) {
         esp_flush(coherence, 4);
     }
 
-    printf("  #######  ######      ######       ####    #     #    #####   \n");
-    printf("  #        #     #    #      #     #        #     #   #     #  \n");
-    printf("  #        #     #   #        #   #         #     #   #        \n");
-    printf("  #######  ######    #        #   #         #######    #####   \n");
-    printf("  #        #         #        #   #         #     #         #  \n");
-    printf("  #        #          #      #     #        #     #   #     #  \n");
-    printf("  #######  #           ######       ####    #     #    #####   \n");
+    printf("  #######   ######      ######       ####    #     #    #####   \n");
+    printf("  #         #     #    #      #     #        #     #   #     #  \n");
+    printf("  #         #     #   #        #   #         #     #   #        \n");
+    printf("  #######   ######    #        #   #         #######    #####   \n");
+    printf("  #         #         #        #   #         #     #         #  \n");
+    printf("  #         #          #      #     #        #     #   #     #  \n");
+    printf("  #######   #           ######       ####    #     #    #####   \n");
 
     // Run transformer on CPU
     // CPU_transformer(
@@ -2009,17 +2219,20 @@ int main(int argc, char * argv[]) {
     // );
 
     // Run transformer on accelerator
-    EdgeBert_transformer(
-        &dev,
-        &plic_dev,
-        mem,
-        12,
-        128,
-        768,
-        64,
-        2,
-        3072
-    );
+    // EdgeBert_transformer(
+    //     &dev,
+    //     &plic_dev,
+    //     mem,
+    //     12,
+    //     128,
+    //     768,
+    //     64,
+    //     2,
+    //     3072
+    // );
+
+    memset(mem, 0, mem_size);
+    EdgeBert_debugging(&dev, &plic_dev, mem);
 
     printf("FINISHing DRIVER\n");
     aligned_free(mem);
