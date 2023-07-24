@@ -25,11 +25,12 @@
 
 typedef char token_t;
 typedef char native_t;
-struct {
-    token_t *values,
-    token_t *mask,
-    token_t *bias
-} mat;
+struct mat {
+    token_t *values;
+    token_t *mask;
+    token_t *bias;
+};
+const int bits_in_bytes = 8;
 
 // Get direct memory access (DMA) per beat
 static unsigned DMA_WORD_PER_BEAT(unsigned _st) {
@@ -47,6 +48,8 @@ const static unsigned input_buffer_size = 65536;
 // Size of aux buffer (in bytes)
 const static unsigned aux_buffer_size = 4096;
 
+const vector_size = 16;
+
 // Attention span
 const static int base_attn_span = 0;
 // Layer normalization
@@ -56,11 +59,6 @@ const static int base_beta = 0;
 const static int adpbias_attn_span = 0;
 const static int adpbias_gamma = 0;
 const static int adpbias_beta = 0;
-
-// QUESTION: What are these?/Why are there three?
-const static int adpbias_act1 = 0;
-const static int adpbias_act2 = 0;
-const static int adpbias_act3 = 0;
 
 // Used to calculate time (get current counter)
 static inline uint64_t get_counter() {
@@ -649,7 +647,7 @@ static void CPU_transformer(
 
 
 // Accelerator functions
-// Data
+// Data functions
 // Output validation
 static int validate_buf(token_t *out, native_t *gold, int out_len) {
     int j;
@@ -720,6 +718,7 @@ static int validate_buf(token_t *out, native_t *gold, int out_len) {
 //     #include "data/ffn/mask_mat2.h"
 // }
 
+
 // Helper functions
 // Wait for interrupt
 static int wait(struct esp_device *plic_dev, int num_interrupts) {
@@ -734,8 +733,7 @@ static int wait(struct esp_device *plic_dev, int num_interrupts) {
     return num_interrupts + 1;
 }
 
-
-// Frequently used functions
+// Master mask read (load from outside and store in accelerator MASK scratchpad)
 static int master_mask_read(
     struct esp_device *dev,
     struct esp_device *plic_dev,
@@ -744,7 +742,6 @@ static int master_mask_read(
     unsigned M,
     int num_interrupts
 ) {
-    // Master mask read (load from outside and store in accelerator MASK scratchpad)
     unsigned data = 0;
 
     // Not writing to memory
@@ -770,6 +767,7 @@ static int master_mask_read(
     return wait(plic_dev, num_interrupts);
 }
 
+// Master input read (load from outside and store in accelerator INPUT scratchpad)
 static int master_input_read(
     struct esp_device *dev,
     struct esp_device *plic_dev,
@@ -778,7 +776,6 @@ static int master_input_read(
     unsigned M,
     int num_interrupts
 ) {
-    // Master input read (load from outside and store in accelerator INPUT scratchpad)
     unsigned data = 0;
 
     // Not writing to memory
@@ -804,6 +801,7 @@ static int master_input_read(
     return wait(plic_dev, num_interrupts);
 }
 
+// Master aux read (load from outside and store in accelerator AUX scratchpad)
 static int master_aux_read(
     struct esp_device *dev,
     struct esp_device *plic_dev,
@@ -811,7 +809,6 @@ static int master_aux_read(
     unsigned M,
     int num_interrupts
 ) {
-    // Master aux read (load from outside and store in accelerator AUX scratchpad)
     unsigned data = 0;
 
     // Not writing to memory
@@ -833,13 +830,13 @@ static int master_aux_read(
     return wait(plic_dev, num_interrupts);
 }
 
+// Master mask write (load from accelerator MASK scratchpad and store outside)
 static int master_mask_write(
     struct esp_device *dev,
     struct esp_device *plic_dev,
     unsigned M,
     int num_interrupts
 ) {
-    // Master mask write (load from accelerator MASK scratchpad and store outside)
     unsigned data = 0;
 
     // Set use_axi to 1
@@ -858,13 +855,13 @@ static int master_mask_write(
     return wait(plic_dev, num_interrupts);
 }
 
+// Master input write (load from accelerator DATA scratchpad and store outside)
 static int master_input_write(
     struct esp_device *dev,
     struct esp_device *plic_dev,
     unsigned M,
     int num_interrupts
 ) {
-    // Master input write (load from accelerator DATA scratchpad and store outside)
     unsigned data = 0;
 
     // Set use_axi to 1
@@ -883,13 +880,13 @@ static int master_input_write(
     return wait(plic_dev, num_interrupts);
 }
 
+// Master aux write (load from accelerator AUX scratchpad and store outside)
 static int master_aux_write(
     struct esp_device *dev,
     struct esp_device *plic_dev,
     unsigned M,
     int num_interrupts
 ) {
-    // Master aux write (load from accelerator AUX scratchpad and store outside)
     unsigned data = 0;
 
     // Set use_axi to 1
@@ -908,44 +905,14 @@ static int master_aux_write(
     return wait(plic_dev, num_interrupts);
 }
 
-static int mat_mul(
-    struct esp_device *dev,
-    struct esp_device *plic_dev,
-    int N0,
-    int M_mat,
-    int N1,
-    int num_interrupts
-) {
-    unsigned data = 0x0;
-
-    // Start matrix size configurations
-    data += N0;
-    data += N1 << 10;
-    data += M_mat << 20;
-    iowrite32(dev, 0x10, data);
-
-    // Set base input of first and second matrix
-    data = 0;
-    data += base_input0;
-    data += base_input1 << 16;
-    iowrite32(dev, 0x14, data);
-
-    // Set offset
-    data = 0;
-    iowrite32(dev, 0x18, data);
-
-    // Start matrix multiplication
-    data = 0x07;
-    iowrite32(dev, 0x04, data);
-
-    // Wait for interrupt
-    return wait(plic_dev, num_interrupts);
-}
-
 
 // Core functions
 // Read for mask (decoder 0 and 1) and aux, set base addresses for read and write
-static int EdgeBert_init(struct esp_device *dev, struct esp_device *plic_dev, token_t *mem) {
+static int EdgeBert_init(
+    struct esp_device *dev,
+    struct esp_device *plic_dev,
+    token_t *mem
+) {
     printf("...STARTing base addr setting for EdgeBert...\n");
 
     // TODO: Our reset hack
@@ -979,9 +946,6 @@ static int EdgeBert_init(struct esp_device *dev, struct esp_device *plic_dev, to
     iowrite32(dev, 0x3C, data);
 
     // Set basic configs
-    // Store base output of computations
-    data += base_output;
-    iowrite32(dev, 0x48, data);
     // Not using SFU
     data = 0;
     iowrite32(dev, 0x50, data);
@@ -992,9 +956,6 @@ static int EdgeBert_init(struct esp_device *dev, struct esp_device *plic_dev, to
     // Set mode to N0
     data = 0x81;
     iowrite32(dev, 0x58, data);
-    // Set number of words
-    data = M - 1;
-    iowrite32(dev, 0x40, data);
 
     printf("...FINISHing base addr setting for EdgeBert...\n");
 }
@@ -1003,18 +964,18 @@ static int EdgeBert_init(struct esp_device *dev, struct esp_device *plic_dev, to
 static void EdgeBert_mat_mul(
     struct esp_device *dev,
     struct esp_device *plic_dev,
+    token_t *mem,
     int N0,
     int N1,
     int M_mat,
+    struct mat *mat1,
+    struct mat *mat2,
     int is_relu,
-    token_t *mem,
-    token_t *mask_mat1,
-    token_t *mask_mat2,
-    token_t *D_mat1,
-    token_t *D_mat2,
-    int softmax
+    int is_bias,
+    int weight_bias,
+    int adf_accum_bias,    // QUESTION: Necessary?
+    int accum_right_shift  // QUESTION: Necessary?
 ) {
-    // TODO: Load in masks
     printf("...STARTing Matmul in EdgeBert...\n");
     int num_interrupts = 0;
 
@@ -1026,27 +987,31 @@ static void EdgeBert_mat_mul(
     unsigned input_rd2_base = ((uintptr_t) mem) + mask_buffer_size + input_buffer_size;
 
     // Loads in matrices from memory
-    memcpy(mem, mask_mat1, mask_buffer_size * sizeof(token_t));
-    memcpy(mem + mask_buffer_size, mask_mat2, mask_buffer_size * sizeof(token_t));
-    memcpy(mem + 2 * mask_buffer_size, D_mat1, N0 * M_mat * sizeof(token_t));
-    memcpy(mem + 2 * mask_buffer_size + input_buffer_size, D_mat2, M_mat * N1 * sizeof(token_t));
+    memcpy(mem, mat1 -> mask, (N0 * N1 / bits_in_bytes) * sizeof(token_t));
+    memcpy(mem + mask_buffer_size, mat2 -> mask, (N1 * M_mat / bits_in_bytes) * sizeof(token_t));
+    memcpy(mem + 2 * mask_buffer_size, mat1 -> values, N0 * M_mat * sizeof(token_t));
+    memcpy(mem + 2 * mask_buffer_size + input_buffer_size, mat2 -> values, M_mat * N1 * sizeof(token_t));
 
     // Load in matrices to accelerator
-    data = 0;
-    data += (M - 1);
-    iowrite32(dev, 0x40, data);
-
     // Master mask read (load from outside and store in accelerator MASK scratchpad) for decoder 0
-    num_interrupts = master_mask_read(dev, plic_dev, mask_rd1_base, 0x0, M, num_interrupts);
-
-    // Master mask read (load from outside and store in accelerator MASK scratchpad) for decoder 1
-    num_interrupts = master_mask_read(dev, plic_dev, mask_rd2_base, 0x1, M, num_interrupts);
+    int M =  N0 * N1 / vector_size;
+    num_interrupts = master_mask_read(dev, plic_dev, mask_rd1_base, 0, M, num_interrupts);
 
     // Load in data to decoder 0
-    num_interrupts = master_input_read(dev, plic_dev, input_rd1_base, 0x0, M, num_interrupts);
+    num_interrupts = master_input_read(dev, plic_dev, input_rd1_base, 0, M, num_interrupts);
+
+    // Master mask read (load from outside and store in accelerator MASK scratchpad) for decoder 1
+    M = N1 * M_mat / vector_size;
+    num_interrupts = master_mask_read(dev, plic_dev, mask_rd2_base, 1, M, num_interrupts);
 
     // Load in data to decoder 1
-    num_interrupts = master_input_read(dev, plic_dev, input_rd2_base, 0x1, M, num_interrupts);
+    num_interrupts = master_input_read(dev, plic_dev, input_rd2_base, 1, M, num_interrupts);
+
+    // Start matrix size configurations
+    data += N0;
+    data += N1 << 10;
+    data += M_mat << 20;
+    iowrite32(dev, 0x10, data);
 
     // Set post-processing configuration
     data = 0;
@@ -1057,16 +1022,47 @@ static void EdgeBert_mat_mul(
     data += accum_right_shift << 20;
     iowrite32(dev, 0x0C, data);
 
-    // QUESTION: Change base_output?
-    // Do matrix multiplication
-    num_interrupts = mat_mul(dev, plic_dev, N0, M_mat, N1, num_interrupts);
+    int num_vector = M_mat / vector_size;
+    int num_timestep = N0;
+    int adpbias_act1 = 0;
+    int adpbias_act2 = 0;
+    int adpbias_act3 = 0;
 
-    // Write data outside
-    if (softmax == 0) {
-        // QUESTION: How to set the address that you write from?
-        // QUESTION: Set num words to write?
-        master_input_write(dev, plic_dev, M, num_interrupts);
-    }
+    data = 0;
+    data += num_vector;
+    data += num_timestep << 8;
+    data += adpbias_act1 << 16;
+    data += adpbias_act2 << 20;
+    data += adpbias_act3 << 24;
+    iowrite32(dev, 0x20, data);
+
+    // Set base input of first and second matrix
+    data = 0;
+    iowrite32(dev, 0x14, data);
+
+    // Set offset
+    data = 0;
+    iowrite32(dev, 0x18, data);
+
+    // Store base output of computations
+    int base_output = N0 * M_mat;
+    data = 0;
+    data += base_output;
+    iowrite32(dev, 0x48, data);
+
+    // Start matrix multiplication
+    data = 0x07;
+    iowrite32(dev, 0x04, data);
+
+    // Do matrix multiplication
+    num_interrupts = wait(plic_dev, num_interrupts);
+
+    // Write data outside if no softmax
+    M = N0 * N1 / vector_size;
+    num_interrupts = master_input_write(dev, plic_dev, M, num_interrupts);
+    num_interrupts = master_mask_write(dev, plic_dev, M, num_interrupts);
+    M = ; // QUESTION: Necessary?
+    num_interrupts = master_aux_write(dev, plic_dev, M, num_interrupts);
 
     printf("...FINISHing Matmul in EdgeBert...\n");
 }
@@ -1138,11 +1134,11 @@ static void EdgeBert_mat_mul(
 //     }
 // }
 
-// // QUESTION: Softmax if the whole row cannot fit?
 // // Softmax for attention head
 // static void EdgeBert_atten_softmax(
 //     struct esp_device *dev,
 //     struct esp_device *plic_dev,
+//     struct mat *mat1,
 //     int N0,
 //     int N1,
 //     int M_mat
@@ -1165,6 +1161,7 @@ static void EdgeBert_mat_mul(
 //     // Set mode to softmax
 //     data = 0x02;
 //     iowrite32(dev, 0x54, data);
+
 //     // Configure parameters
 //     data = 0;
 //     data += base_attn_span;
@@ -1174,6 +1171,7 @@ static void EdgeBert_mat_mul(
 //     data += adpbias_gamma << 26;
 //     data += adpbias_beta << 29;
 //     iowrite32(dev, 0x1C, data);
+
 //     data = 0;
 //     data += num_vector;
 //     data += num_timestep << 8;
@@ -1181,6 +1179,7 @@ static void EdgeBert_mat_mul(
 //     data += adpbias_act2 << 20;
 //     data += adpbias_act3 << 24;
 //     iowrite32(dev, 0x20, data);
+
 //     // Configure matrix size
 //     data = 0x0;
 //     data += N0;
