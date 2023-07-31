@@ -1131,8 +1131,28 @@ static struct mat *general_mat_mul(
     struct mat *mat2,
     int is_relu,
     int is_bias,
-    int weight_bias
+    int weight_bias,
+    int write
 ) {
+    // Do not write out if there is enough space to keep on accelerator
+    if (write != 0 && N0 * (M_mat + N1) <= input_buffer_size && M_mat * N1 <= input_buffer_size) {
+        EdgeBert_mat_mul(
+            dev,
+            plic_dev,
+            mem,
+            N0,
+            N1,
+            M_mat,
+            mat1,
+            mat2,
+            is_relu,
+            is_bias,
+            weight_bias,
+            write
+        );
+        return NULL;
+    }
+
     unsigned N0_tile;
     unsigned N1_tile;
 
@@ -1521,28 +1541,33 @@ static struct mat *EdgeBert_pooler(
     token_t *val_mat1 = aligned_malloc(hidden_size * hidden_size);
     token_t *mask_mat1 = aligned_malloc(hidden_size * hidden_size / bits_in_bytes);
     int bias_mat1 = 0;
+    *we_mat1 = (struct mat) {val_mat1, mask_mat1, bias_mat1};
+
+    struct mat *input = aligned_malloc(sizeof(struct mat));
+    token_t *val_input = aligned_malloc(hidden_size);
+    token_t *mask_input = aligned_malloc(hidden_size / bits_in_bytes);
+    *input = (struct mat) {val_input, mask_input, attention_heads -> bias};
 
     // Fill with data
     // EdgeBert_init_buf_pooler(val_mat1, mask_mat1, bias_mat1);
     memset(val_mat1, 1, hidden_size * hidden_size);
     memset(mask_mat1, 255, hidden_size * hidden_size / bits_in_bytes);
-    // TODO: Add memset
-    *we_mat1 = (struct mat) {val_mat1, mask_mat1, bias_mat1};
+
+    // Take first token
+    memcpy(val_input, attention_heads -> values, hidden_size);
+    memcpy(mask_input, attention_heads -> mask, hidden_size / bits_in_bytes);
 
     // Matrix multiplication configurations
-    int N0;
-    int N1;
-    int M_mat;
-    int is_relu;
-    int is_bias;
-    int weight_bias;
-    int softmax;
-
-    N0 = input_m; M_mat = hidden_size; N1 = hidden_size;
-    is_relu = 0, is_bias = 0, weight_bias = 0, softmax = 0;
+    unsigned N0 = input_m;
+    unsigned N1 = hidden_size;
+    unsigned M_mat = 1;
+    unsigned is_relu = 0;
+    unsigned is_bias = 0;
+    unsigned weight_bias = 0;
+    unsigned write = 0;
 
     // Query multiplication
-    general_mat_mul(
+    struct mat* output = general_mat_mul(
         dev,
         plic_dev,
         mem,
@@ -1559,21 +1584,15 @@ static struct mat *EdgeBert_pooler(
 
     // Activation?
 
-    // TODO: Fix architecture
-    // Get hidden states for first token
-    struct mat *out = aligned_malloc(sizeof(struct mat));
-    token_t *val_out = aligned_malloc(hidden_size);
-    token_t *mask_out = aligned_malloc(hidden_size / 8);
-
-    // Copy over data
-    memcpy(out, mem + 2 * mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, hidden_size);
-    out = (struct mat) {val_out, mask_out, accum_right_shift};
-
     // Free allocated space
     aligned_free(val_mat1);
     aligned_free(mask_mat1);
     aligned_free(we_mat1);
-    return out;
+
+    aligned_free(val_input);
+    aligned_free(mask_input);
+    aligned_free(input);
+    return output;
 }
 
 static token_t *EdgeBert_highway_exit(
@@ -1587,7 +1606,7 @@ static token_t *EdgeBert_highway_exit(
 ) {
     // Highway exit
     // Index in to layer outputs
-    token_t *pooler_output = EdgeBert_pooler(
+    struct mat *pooler_output = EdgeBert_pooler(
         dev,
         plic_dev,
         mem,
@@ -1598,36 +1617,48 @@ static token_t *EdgeBert_highway_exit(
 
     // Intialize linear layer and outputs
     struct mat *we_mat1 = aligned_malloc(sizeof(struct mat));
-    token_t *val_mat1 = aligned_malloc(num_labels * hidden_size * sizeof(token_t));
+    token_t *val_mat1 = aligned_malloc(num_labels * hidden_size);
     token_t *mask_mat1 = aligned_malloc(num_labels * hidden_size / bits_in_bytes);
-
-    struct mat *outpt = aligned_malloc(sizeof(struct mat));
-    token_t *val_output;
-    token_t *mask_ouptut;
+    int bias_mat1 = 0;
+    *we_mat1 = (struct mat) {val_mat1, mask_mat1, bias_mat1};
 
     // Fill with data
-    EdgeBert_init_buf_highway(we_mat1);
+    // EdgeBert_init_buf_highway(we_mat1);
+    memset(val_mat1, 1, num_labels * hidden_size);
+    memset(mask_mat1, 255, num_labels * hidden_size / bits_in_bytes);
 
     // Initialize config
-    int N0;
-    int N1;
-    int M_mat;
-    unsigned is_relu;
-    int softmax;
-
-    N0 = num_labels;
-    M_mat = hidden_size;
-    N1 = 1;
-    is_relu = 0;
-    softmax = 0;
+    unsigned N0 = num_labels;
+    unsigned N1 = 1;
+    unsigned M_mat = hidden_size;
+    unsigned is_relu = 0;
+    unsigned is_bias = 0;
+    unsigned weight_bias = 0;
+    unsigned write = 0;
 
     // Perform matrix multiplication
-    general_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat1, mask_mat2, we_mat1, pooler_output, softmax);
-    memcpy(result_mat_1, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
+    struct mat* output = general_mat_mul(
+        dev,
+        plic_dev,
+        mem,
+        N0,
+        N1,
+        M_mat,
+        we_mat1,
+        pooler_output,
+        is_relu,
+        is_bias,
+        weight_bias,
+        write
+    );
 
-    aligned_free(we_mat1);
+    // Free memory
+    aligned_free(val_mat1);
     aligned_free(mask_mat1);
-    aligned_free(mask_mat2);
+    aligned_free(we_mat1);
+    aligned_free(pooler_output -> values);
+    aligned_free(pooler_output -> mask);
+    aligned_free(pooler_output);
 
     return output;
 }
@@ -1646,28 +1677,31 @@ static token_t *EdgeBert_attention(
     int num_interrupts;
 
     // Initialize inputs and weights
-    token_t *input_ids;
-    token_t *mask_input;
-    token_t *we_query;
-    token_t *mask_query;
-    token_t *we_key;
-    token_t *mask_key;
-    token_t *we_val;
-    token_t *mask_val;
-    token_t *aux_mat;
+    struct mat *input = aligned_malloc(sizeof(struct mat));
+    token_t *val_input = aligned_malloc(input_m * input_n);
+    token_t *mask_input = aligned_malloc(input_m * input_n / bits_in_bytes);
+    int bias_input = 0;
+    *input = (struct mat) {val_input, mask_input, bias_input};
+    
+    struct mat *we_query = aligned_malloc(sizeof(struct mat));
+    token_t *val_query = aligned_malloc(input_n * hidden_size);
+    token_t *mask_query = aligned_malloc(input_n * hidden_size / bits_in_bytes);
+    int bias_query = 0;
+    *we_query = (struct mat) {val_query, mask_query, bias_query};
 
-    // Initialize IDs
-    input_ids = aligned_malloc(input_m * input_n);
-    mask_input = aligned_malloc(ceil_div(input_m * input_n, 8));
-    we_query = aligned_malloc(input_n * hidden_size);
-    mask_query = aligned_malloc(ceil_div(input_n * hidden_size, 8));
-    we_key = aligned_malloc(input_n * hidden_size);
-    mask_key = aligned_malloc(ceil_div(input_n * hidden_size, 8));
-    we_val = aligned_malloc(input_n * hidden_size);
-    mask_val = aligned_malloc(ceil_div(input_n * hidden_size, 8));
+    struct mat *we_key = aligned_malloc(sizeof(struct mat));
+    token_t *val_key = aligned_malloc(input_n * hidden_size);
+    token_t *mask_key = aligned_malloc(input_n * hidden_size / bits_in_bytes);
+    int bias_key = 0;
+    *we_key = (struct mat) {val_key, mask_key, bias_key};
 
-    // QUESTION: Size?
-    aux_mat = aligned_malloc(4096);
+    struct mat *we_val = aligned_malloc(sizeof(struct mat));
+    token_t *val_val = aligned_malloc(input_n * hidden_size);
+    token_t *mask_val = aligned_malloc(input_n * hidden_size / bits_in_bytes);
+    int bias_val = 0;
+    *we_val = (struct mat) {val_val, mask_val, bias_val};
+
+    token_t *span_mat = aligned_malloc(input_m * input_m / bits_in_bytes);
 
     // Initialize weights
     // EdgeBert_init_buf_attention(
