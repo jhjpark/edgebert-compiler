@@ -2031,7 +2031,7 @@ static struct mat *EdgeBert_attention_heads(
     return attention_heads;
 }
 
-static void EdgeBert_processing(
+static struct mat *EdgeBert_processing(
     struct esp_device *dev,
     struct esp_device *plic_dev,
     token_t *mem,
@@ -2105,7 +2105,7 @@ static void EdgeBert_processing(
     N0 = input_m, M_mat = input_n;
 
     // TODO: Fix
-    general_element_add(
+    struct mat *output = general_element_add(
         dev,
         plic_dev,
         mem,
@@ -2119,11 +2119,11 @@ static void EdgeBert_processing(
     printf("FINISHing 12 Attention Heads Processing...\n");
     printf("###(%"PRIu64" clock cycles)###\n", count2 - count1);
 
-    return attention_out;
+    return output;
 }
 
 // Feed forward
-static token_t *EdgeBert_feed_forward(
+static struct mat *EdgeBert_feed_forward(
     struct esp_device *dev,
     struct esp_device *plic_dev,
     token_t *mem,
@@ -2142,146 +2142,101 @@ static token_t *EdgeBert_feed_forward(
 
     // Initialize weights
     struct mat *we_mat1 = aligned_malloc(sizeof(struct mat));
-    token_t *val_attention_heads = aligned_malloc(input_m * hidden_size * num_heads);
-    token_t *mask_attention_heads = aligned_malloc(input_m * hidden_size * num_heads / bits_in_bytes);
-    *attention_heads = (struct mat) {val_attention_heads, mask_attention_heads, adf_accum_bias};
+    token_t *val_mat1 = aligned_malloc(input_n * hidden_size_ffn);
+    token_t *mask_mat1 = aligned_malloc(input_n * hidden_size_ffn / bits_in_bytes);
+    int bias_mat1 = 0;
+    *we_mat1 = (struct mat) {val_mat1, mask_mat1, bias_mat1};
 
     struct mat *we_mat2 = aligned_malloc(sizeof(struct mat));
-    token_t *val_attention_heads = aligned_malloc(input_m * hidden_size * num_heads);
-    token_t *mask_attention_heads = aligned_malloc(input_m * hidden_size * num_heads / bits_in_bytes);
-    *attention_heads = (struct mat) {val_attention_heads, mask_attention_heads, adf_accum_bias};
+    token_t *val_mat2 = aligned_malloc(input_n * hidden_size_ffn);
+    token_t *mask_mat2 = aligned_malloc(input_n * hidden_size_ffn / bits_in_bytes);
+    int bias_mat2 = 0;
+    *we_mat2 = (struct mat) {val_mat2, mask_mat2, bias_mat2};
 
-    we_mat1 = aligned_malloc(768 * 3072);
-    we_mat2 = aligned_malloc(768 * 3072);
-
+    // Load data
     // init_buf_ffn(we_mat1, we_mat2);
-    // Load dummy data
-    memset(we_mat1, -1, 768 * 3072 * sizeof(token_t));
-    memset(we_mat2, -12, 768 * 3072 * sizeof(token_t));
+    memset(val_mat1, -1, input_n * hidden_size_ffn);
+    memset(val_mat2, -12, input_n * hidden_size_ffn);
+    memset(mask_mat1, 255, input_n * hidden_size_ffn / bits_in_bytes);
+    memset(mask_mat2, 255, input_n * hidden_size_ffn / bits_in_bytes);
 
-    // Multiply attention output by weights ((128 x 768) x (768 x 3072) = (128 x 3072))
-    unsigned N0;
-    unsigned N1;
-    unsigned M_mat;
-    unsigned is_relu;
+    // Multiply attention output by weights
+    unsigned N0 = input_m;
+    unsigned N1 = hidden_size_ffn;
+    unsigned M_mat = input_n;
+    unsigned is_relu = 0;
+    unsigned is_bias = 0;
+    unsigned weight_bias = 0;
+    unsigned write = 0;
 
-    N0 = 64;
-    M_mat = 768;
-    N1 = 64;
-    is_relu = 1;
+    struct mat *mat_output1 = general_mat_mul(
+        dev,
+        plic_dev,
+        mem,
+        N0,
+        N1,
+        M_mat,
+        attention_head_out,
+        we_mat1,
+        is_relu,
+        is_bias,
+        weight_bias,
+        write
+    );
 
-    // Split attention output into two
-    token_t *input_1;     // 64 x 768
-    token_t *input_2;     // 768 x 64
-    token_t *relu_output; // 128 x 3072
+    aligned_free(we_mat1 -> values);
+    aligned_free(we_mat1 -> mask);
+    aligned_free(we_mat1);
 
-    input_1 = aligned_malloc(N0 * M_mat);
-    input_2 = aligned_malloc(M_mat * N1);
-    relu_output = aligned_malloc(128 * 3072);
+    // Multiply with second weights
+    N0 = input_m;
+    M_mat = hidden_size_ffn;
+    N1 = input_n;
 
-    EdgeBert_init(dev, plic_dev, mem);
-    int count = 0;
+    struct mat *mat_output2 = general_mat_mul(
+        dev,
+        plic_dev,
+        mem,
+        N0,
+        N1,
+        M_mat,
+        mat_output1,
+        we_mat2,
+        is_relu,
+        is_bias,
+        weight_bias,
+        write
+    );
 
-    for (int i = 0; i < 2; i++) {
-        // Load in half of attention output
-        memcpy(input_1, processing_out + i * N0 * M_mat, N0 * M_mat * sizeof(token_t));
+    N0 = input_m;
+    M_mat = input_n;
 
-        for (int j = 0; j < 48; j++) {
-            // TODO: Need to transpose?
-            memcpy(input_2, we1_mat + j * M_mat * N1, M_mat * N1 * sizeof(token_t));
-
-            if (count == 2) {
-                EdgeBert_init(dev, plic_dev, mem);
-                count = 0;
-            }
-            EdgeBert_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, input_1, input_2, softmax);
-            // memcpy(relu_output + N0 * N1 * i * j, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
-
-            // Copy over data into relu_output
-            for (int l = 0; l < N0; l++) {
-                for (int k = 0; k < N1; k++) {
-                    relu_output[(l + i * N0) * 3072 + j * N1 + k] = mem[mask_buffer_size + 2 * input_buffer_size + aux_buffer_size + l * N0 + k];
-                }
-            }
-            count++;
-        }
-    }
-
-    // Multiply relu_out with second weights ((8 x 16) x 3072) x (3072 x (16 x 48))
-    N0 = 16;
-    M_mat = 3072;
-    N1 = 16;
-    is_relu = 0;
-
-    aligned_free(input_1);
-    aligned_free(input_2);
-    token_t *we2_output;
-
-    input_1 = aligned_malloc(N0 * M_mat);
-    input_2 = aligned_malloc(M_mat * N1);
-    we2_output = aligned_malloc(128 * 768);
-
-    // EdgeBert_init(dev, plic_dev, mem);
-    count = 0;
-
-    for (int i = 0; i < 8; i++) {
-        memcpy(input_1, relu_output + i * N0 * M_mat, N0 * M_mat * sizeof(token_t));
-
-        for (int j = 0; j < 48; j++) {
-            memcpy(input_2, we2_mat + j * M_mat * N1, M_mat * N1 * sizeof(token_t));
-
-            if (count == 2) {
-                // EdgeBert_init(dev, plic_dev, mem);
-                count = 0;
-            }
-
-            EdgeBert_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, input_1, input_2, softmax);
-            // memcpy(we2_output + N0 * N1 * i * j, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
-
-            for (int l = 0; l < N0; l++) {
-                for (int k = 0; k < N1; k++) {
-                    we2_output[(l + i * N0) * 768 + j * N1 + k] = mem[mask_buffer_size + 2 * input_buffer_size + aux_buffer_size + l * N0 + k];
-                }
-            }
-            count++;
-        }
-    }
-
-    aligned_free(input_1);
-    aligned_free(input_2);
-
-    N0 = 64;
-    M_mat = 768;
-    N1 = 64;
-
+    // TODO: Fix
     // Add attention output
-    token_t* FFN_output;
-    input_1 = aligned_malloc(N0 * M_mat);
-    input_2  = aligned_malloc(M_mat * N1);
-    CPU_transpose(processing_out, 768, 128);
-    FFN_output = aligned_malloc(128*768);
-
-    for (int i = 0; i < 2; i++) {
-        // Add parts of attention output
-        memcpy(input_1, we2_output + i * N0 * M_mat, N0 * M_mat * sizeof(token_t));
-        memcpy(input_2, processing_out + i * N1 * M_mat, N1 * M_mat * sizeof(token_t));
-        EdgeBert_init(dev, plic_dev, mem);
-        EdgeBert_ElementAddLayerNorm(dev, plic_dev, N0, N1, M_mat, mem, input_1, input_2);
-        memcpy(FFN_output + i * N0 * M_mat, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * M_mat * sizeof(token_t));
-    }
+    struct mat *output = general_element_add(
+        dev,
+        plic_dev,
+        mem,
+        N0,
+        M_mat,
+        attention_head_out,
+        mat_output2,
+        write
+    );
 
     // Free memory
-    aligned_free(input_1);
-    aligned_free(input_2);
-    aligned_free(we2_output);
-    aligned_free(mask_mat);
-    aligned_free(we1_mat);
-    aligned_free(we2_mat);
-    aligned_free(relu_output);
+    aligned_free(attention_head_out -> values);
+    aligned_free(attention_head_out -> mask);
+    aligned_free(attention_head_out);
+
+    aligned_free(we_mat2 -> values);
+    aligned_free(we_mat2 -> mask);
+    aligned_free(we_mat2);
 
     count2 = get_counter();
     printf("FINISHing EdgeBERT Feed Forward Net Computation...\n");
     printf("###(taking %"PRIu64" clock cycles)###...\n", count2 - count1);
+    return output;
 }
 
 static void EdgeBert_transformer(
