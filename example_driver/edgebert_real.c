@@ -1244,8 +1244,10 @@ static struct mat *general_mat_mul(
             }
 
             // Copy over mask into output
-            for (int l = 0; l < N0_mat * N1_mat / bits_in_bytes; l++) {
-                output -> mask[(row * N1 + col) / bits_in_bytes + l] = smaller_ouptut -> mask[l];
+            for (int l = 0; l < N0_mat; l++) {
+                for (int k = 0; k < N1_mat / bits_in_bytes; k++) {
+                    output -> mask[(N1 * (row + l) + col) / bits_in_bytes + k] = smaller_ouptut -> mask[N1_mat / bits_in_bytes * l + k];
+                }
             }
             col += N1_mat;
         }
@@ -1272,8 +1274,7 @@ static struct mat *EdgeBert_atten_softmax(
     int N0,
     int M_mat,
     struct mat *input,
-    token_t *span_mask,
-    struct mat *output
+    token_t *span_mask
 ) {
     printf("STARTing attention softmax in EdgeBert...\n");
 
@@ -1364,18 +1365,30 @@ static struct mat *EdgeBert_atten_softmax(
     num_interrupts = wait(plic_dev, num_interrupts);
 
     // Master input write
-    struct mat *out = write_matrix(
+    struct mat *output = write_matrix(
         dev,
         plic_dev,
         mem,
         N0,
         M_mat,
-        output,
+        NULL,
         num_interrupts
     );
 
     printf("FINISHing attention softmax in EdgeBert...\n");
-    return out;
+    return output;
+}
+
+static struct mat *general_softmax(
+    struct esp_device *dev,
+    struct esp_device *plic_dev,
+    token_t *mem,
+    int N0,
+    int M_mat,
+    struct mat *input,
+    token_t *span_mask
+) {
+    // TODO
 }
 
 static struct mat *EdgeBert_element_add(
@@ -1389,6 +1402,7 @@ static struct mat *EdgeBert_element_add(
     int write
 ) {
     printf("...STARTing Element Add in EdgeBert...\n");
+
     int num_interrupts = 0;
     num_interrupts = load_matrices(
         dev,
@@ -1451,7 +1465,7 @@ static struct mat *EdgeBert_element_add(
 
     // Write data outside
     if (write == 0) {
-        num_interrupts = write_matrix(
+        struct mat *output = write_matrix(
             dev,
             plic_dev,
             mem,
@@ -1459,12 +1473,27 @@ static struct mat *EdgeBert_element_add(
             M_mat,
             num_interrupts
         );
+        return output;
     }
     printf("...FINISHing Element Add in EdgeBert...\n");
+    return NULL;
+}
+
+static struct mat *general_element_add(
+    struct esp_device *dev,
+    struct esp_device *plic_dev,
+    token_t *mem,
+    int N0,
+    int M_mat,
+    struct mat *mat1,
+    struct mat *mat2,
+    int write
+) {
+    // TODO
 }
 
 // Apply layer norm
-static void EdgeBert_layer_norm(
+static struct mat *EdgeBert_layer_norm(
     struct esp_device *dev,
     struct esp_device *plic_dev,
     token_t *mem,
@@ -1473,8 +1502,9 @@ static void EdgeBert_layer_norm(
     struct mat *mat1
 ) {
     printf("...STARTing Element Add in EdgeBert...\n");
-    unsigned data = 0;
+
     int num_interrupts = 0;
+    unsigned data = 0;
 
     if (mat1) {
         load_matrix(
@@ -1551,7 +1581,7 @@ static void EdgeBert_layer_norm(
     num_interrupts = wait(plic_dev, num_interrupts);
 
     // Write output to outside
-    num_interrupts = write_matrix(
+    struct mat *output = write_matrix(
         dev,
         plic_dev,
         mem,
@@ -1561,6 +1591,18 @@ static void EdgeBert_layer_norm(
     );
 
     printf("...FINISHing Layer Norm in EdgeBert...\n");
+    return output;
+}
+
+static struct mat *general_layer_norm(
+    struct esp_device *dev,
+    struct esp_device *plic_dev,
+    token_t *mem,
+    int N0,
+    int M_mat,
+    struct mat *mat1
+) {
+    // TODO
 }
 
 static void EdgeBert_entropy(
@@ -1617,12 +1659,12 @@ static struct mat *EdgeBert_pooler(
         N0,
         N1,
         M_mat,
-        attention_heads,
         we_mat1,
+        input,
         is_relu,
         is_bias,
         weight_bias,
-        softmax
+        write
     );
 
     // Activation?
@@ -1825,6 +1867,23 @@ static token_t *EdgeBert_attention(
         write
     );
 
+    // Free inputs and weights
+    aligned_free(val_input);
+    aligned_free(mask_input);
+    aligned_free(input);
+    
+    aligned_free(val_query);
+    aligned_free(mask_query);
+    aligned_free(we_query);
+
+    aligned_free(val_key);
+    aligned_free(mask_key);
+    aligned_free(we_key);
+
+    aligned_free(val_val);
+    aligned_free(mask_val);
+    aligned_free(we_val);
+
     // Transpose output of key multiplication
     CPU_transpose(mat_key -> values, N0, N1);
     CPU_transpose(mat_key -> mask, N0, N1 / bits_in_bytes);
@@ -1858,7 +1917,7 @@ static token_t *EdgeBert_attention(
     N1 = input_m;
 
     // Apply softmax
-    EdgeBert_atten_softmax(
+    struct mat *mat_query_key = EdgeBert_atten_softmax(
         dev,
         plic_dev,
         mem,
@@ -1867,35 +1926,51 @@ static token_t *EdgeBert_attention(
         NULL,
         span_mat
     );
-    memcpy(query_key_mat, mem + 2 * mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
 
     // Free memory
-    aligned_free(query_mat);
-    aligned_free(key_mat);
+    aligned_free(mat_query -> values);
+    aligned_free(mat_query -> mask);
+    aligned_free(mat_query);
+    aligned_free(mat_key -> values);
+    aligned_free(mat_key -> mask);
+    aligned_free(mat_key);
+    aligned_free(span_mat);
 
     // Multiply query and key with value matrix
     N0 = input_m;
     M_mat = input_m;
     N1 = hidden_size;
-    softmax = 0;
+    write = 0;
 
-    general_mat_mul(dev, plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, query_key_mat, val_mat, softmax);
-    memcpy(val_mat, mem + 2 * mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1 * sizeof(token_t));
+    struct mat *output = general_mat_mul(
+        dev,
+        plic_dev,
+        mem,
+        N0,
+        N1,
+        M_mat,
+        mat_query_key,
+        mat_val,
+        is_relu,
+        is_bias,
+        weight_bias,
+        write
+    );
 
     // Free memory
-    aligned_free(input_ids);
-    aligned_free(we_query);
-    aligned_free(we_key);
-    aligned_free(we_val);
-    aligned_free(mask_mat);
-    aligned_free(aux_mat);
-    aligned_free(query_key_mat);
+    aligned_free(mat_val -> values);
+    aligned_free(mat_val -> mask);
+    aligned_free(mat_val);
+
+    aligned_free(mat_query_key -> values);
+    aligned_free(mat_query_key -> mask);
+    aligned_free(mat_query_key);
 
     printf("FINISHing Attention Head in EdgeBert...\n");
-    return val_mat;
+    return output;
 }
 
-static token_t *EdgeBert_attention_heads(
+static struct mat *EdgeBert_attention_heads(
     struct esp_device *dev,
     struct esp_device *plic_dev,
     token_t *mem,
@@ -1913,13 +1988,15 @@ static token_t *EdgeBert_attention_heads(
     uint64_t count2;
     uint64_t exe_cycle;
 
-    token_t* attention_heads;
-    attention_heads = aligned_malloc(input_m * hidden_size * num_heads);
+    struct mat *attention_heads = aligned_malloc(sizeof(struct mat));
+    token_t *val_attention_heads = aligned_malloc(input_m * hidden_size * num_heads);
+    token_t *mask_attention_heads = aligned_malloc(input_m * hidden_size * num_heads / bits_in_bytes);
+    *attention_heads = (struct mat) {val_attention_heads, mask_attention_heads, adf_accum_bias};
 
     for (int i = 0; i < 12; i++) {
         // Run attention head
         count1 = get_counter();
-        EdgeBert_attention(
+        struct mat *head_output = EdgeBert_attention(
             dev,
             plic_dev,
             mem,
@@ -1931,9 +2008,17 @@ static token_t *EdgeBert_attention_heads(
         exe_cycle = count2 - count1;
         printf("...Attention Head %d takes %"PRIu64" clock cycles...\n", i, exe_cycle);
 
+        // Copy over values
         for (int l = 0; l < input_m; l++) {
             for (int k = 0; k < hidden_size; k++) {
-                attention_heads[l * hidden_size * num_heads + i * hidden_size + k] = mem[2 * mask_buffer_size + 2 * input_buffer_size + aux_buffer_size + l * hidden_size + k];
+                attention_heads -> values[hidden_size * num_heads * l + hidden_size * i + k] = head_output -> values[hidden_size * l + k];
+            }
+        }
+
+        // Copy over mask
+        for (int l = 0; l < input_m; l++) {
+            for (int k = 0; k < hidden_size / bits_in_bytes; k++) {
+                attention_heads -> mask[(hidden_size * num_heads * l + hidden_size * i) / bits_in_bytes + k] = head_output -> mask[hidden_size / bits_in_bytes * l + k];
             }
         }
 
@@ -1950,11 +2035,11 @@ static void EdgeBert_processing(
     struct esp_device *dev,
     struct esp_device *plic_dev,
     token_t *mem,
-    token_t *attention_heads,
+    struct mat *attention_heads,
     int num_heads,
     int input_m,
     int input_n,
-    int num_labels
+    int hidden_size
 ) {
     printf("STARTing 12 Attention Heads Processing...\n");
 
@@ -1965,84 +2050,71 @@ static void EdgeBert_processing(
     uint64_t exe_cycle;
 
     count1 = get_counter();
-    // Multiply concatenated output (128 x 768)
-    token_t* we_mat1;
-    we_mat1 = aligned_malloc(768 * 768);
-    // Fill with dummy data
-    EdgeBert_init_buf_processing(we_mat1);
+    struct mat *we_mat1 = aligned_malloc(sizeof(struct mat));
+    token_t* val_mat1 = aligned_malloc(num_heads * hidden_size * input_n);
+    token_t *mask_mat1 = aligned_malloc(num_heads * hidden_size * input_n / bits_in_bytes);
 
-    // QUESTION: Should mask also be included in the data?
-    token_t *mask_mat;
-    mask_mat = aligned_malloc(8192);
     // Fill with dummy data
-    memset(mask_mat, 255, 8192 * sizeof(token_t));
-
-    // Use accelerator and split input into two
-    token_t *input_1;
-    token_t *input_2;
+    // EdgeBert_init_buf_processing(we_mat1);
+    memset(val_mat1, 1, num_heads * hidden_size * input_n);
+    memset(mask_mat1, 255, num_heads * hidden_size * input_n / bits_in_bytes);
 
     // Matrix multiplication configurations
-    unsigned N0;
-    unsigned N1;
-    unsigned M_mat;
-    unsigned is_relu;
+    unsigned N0 = input_m;
+    unsigned N1 = input_n;
+    unsigned M_mat = hidden_size * num_heads;
+    unsigned is_relu = 0;
+    unsigned is_bias = 0;
+    unsigned weight_bias = 0;
+    unsigned write = 0;
 
-    N0 = 64;
-    M_mat = 768;
-    N1 = 64;
-    is_relu = 0;
+    struct mat *mat_output1 = general_mat_mul(
+        dev,
+        plic_dev,
+        mem,
+        N0,
+        N1,
+        M_mat,
+        attention_heads,
+        we_mat1,
+        is_relu,
+        is_bias,
+        weight_bias,
+        write
+    );
 
-    input_1 = aligned_malloc(N0 * M_mat);
-    input_2 = aligned_malloc(M_mat * N1);
+    // Free memory
+    aligned_free(attention_heads -> values);
+    aligned_free(attention_heads -> mask);
+    aligned_free(attention_heads);
 
-    EdgeBert_init(&dev, &plic_dev, mem);
-    int count = 0;
-    for (int i = 0; i < 2; i++) {
-        memcpy(input_1, attention_heads + i * N0 * M_mat, N0 * M_mat * sizeof(token_t));
-        for (int j = 0; j < 12; j++) {
-            memcpy(input_2, We_heads + j * M_mat * N1, M_mat * N1 * sizeof(token_t));
-
-            if (count == 2) {
-                EdgeBert_init(&dev, &plic_dev, mem);
-                count = 0;
-            }
-
-            EdgeBert_mat_mul (&dev, &plic_dev, N0, N1, M_mat, is_relu, mem, mask_mat, input_1, input_2, 0);
-            for (int l = 0; l < N0; l++) {
-                for (int k = 0; k < N1; k++) {
-                    attention_head_out[(l + i * N0) * 768 + j * N1 + k] = mem[mask_buffer_size + 2 * input_buffer_size + aux_buffer_size + k + l * N0];
-                }
-            }
-            count++;
-        }
-    }
-
-    aligned_free(input_1);
-    aligned_free(input_2);
-
-    N0 = 64;
-    M_mat = 768;
-    N1 = 64;
-
-    token_t* attention_out;
-    input_1 = aligned_malloc(N0 * M_mat);
-    input_2  = aligned_malloc(M_mat * N1);
+    aligned_free(we_mat1 -> values);
+    aligned_free(we_mat1 -> mask);
+    aligned_free(we_mat1);
 
     // Add on input IDs and layer norm
-    token_t* input_ids;
-    input_ids = aligned_malloc(128 * 768);
-    memset(input_ids, -1, 128 * 768 * sizeof(token_t));
-    CPU_transpose(input_ids, 768, 128);
-    attention_out = aligned_malloc(128 * 768);
+    struct mat *input = aligned_malloc(sizeof(struct mat));
+    token_t *val_input = aligned_malloc(input_m * input_n);
+    token_t *mask_input = aligned_malloc(input_m * input_n / bits_in_bytes);
+    int bias_input = 0;
+    *input = (struct mat) {val_input, mask_input, bias_input};
 
-    for (int i = 0; i < 2; i++) {
-        // Split 128 x 768 into two 64 x 768
-        memcpy(input_1, attention_head_out + i * N0 * M_mat, N0 * M_mat * sizeof(token_t));
-        memcpy(input_2, input_ids + i * N1 * M_mat, N1 * M_mat * sizeof(token_t));
-        EdgeBert_init(&dev, &plic_dev, mem);
-        EdgeBert_element_add_layer_norm(&dev, &plic_dev, N0, N1, M_mat, mem, input_1, input_2);
-        memcpy(attention_out + i * N0 * M_mat, mem + mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * M_mat * sizeof(token_t));
-    }
+    memset(val_input, 11, input_m * input_n);
+    memset(mask_input, 255, input_m * input_n / bits_in_bytes);
+
+    N0 = input_m, M_mat = input_n;
+
+    // TODO: Fix
+    general_element_add(
+        dev,
+        plic_dev,
+        mem,
+        N0,
+        M_mat,
+        input,
+        mat_output1,
+        write
+    );
     count2 = get_counter();
     printf("FINISHing 12 Attention Heads Processing...\n");
     printf("###(%"PRIu64" clock cycles)###\n", count2 - count1);
@@ -2060,23 +2132,24 @@ static token_t *EdgeBert_feed_forward(
     int input_n,
     int hidden_size_ffn
 ) {
-    printf("\nSTARTing EdgeBERT Feed Forward Net Computation...\n");
+    printf("STARTing EdgeBERT Feed Forward Net Computation...\n");
     uint64_t total_exe_cycle = 0;
     uint64_t count1;
     uint64_t count2;
     uint64_t exe_cycle;
 
     count1 = get_counter();
-    EdgeBert_init(&dev, &plic_dev, mem);
-
-    int softmax = 0;
-    token_t *mask_mat;
-    mask_mat = aligned_malloc(8192);
-    memset(mask_mat, 255, 8192 * sizeof(token_t));
 
     // Initialize weights
-    token_t* we_mat1; // 768 x 3072
-    token_t* we_mat2; // 3072 x 768
+    struct mat *we_mat1 = aligned_malloc(sizeof(struct mat));
+    token_t *val_attention_heads = aligned_malloc(input_m * hidden_size * num_heads);
+    token_t *mask_attention_heads = aligned_malloc(input_m * hidden_size * num_heads / bits_in_bytes);
+    *attention_heads = (struct mat) {val_attention_heads, mask_attention_heads, adf_accum_bias};
+
+    struct mat *we_mat2 = aligned_malloc(sizeof(struct mat));
+    token_t *val_attention_heads = aligned_malloc(input_m * hidden_size * num_heads);
+    token_t *mask_attention_heads = aligned_malloc(input_m * hidden_size * num_heads / bits_in_bytes);
+    *attention_heads = (struct mat) {val_attention_heads, mask_attention_heads, adf_accum_bias};
 
     we_mat1 = aligned_malloc(768 * 3072);
     we_mat2 = aligned_malloc(768 * 3072);
