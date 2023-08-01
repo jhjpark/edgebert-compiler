@@ -13,10 +13,9 @@
 #define __STDC_FORMAT_MACROS
 #include <inttypes.h>
 
-// Platform-Level Interrupt Controller (PLIC) (base address)
 #define PLIC_ADDR 0x6c000000
-#define PLIC_IP_OFFSET 0x1000       // Interrupt Pending
-#define PLIC_INTACK_OFFSET 0x200004 // Interrupt Acknowledge
+#define PLIC_IP_OFFSET 0x1000
+#define PLIC_INTACK_OFFSET 0x200004
 #define EDGEBERT_IRQ 5
 
 #define MAX_PRINTED_ERRORS 10
@@ -2084,7 +2083,7 @@ static struct mat *EdgeBert_attention(
     aligned_free(val_input);
     aligned_free(mask_input);
     aligned_free(input);
-    
+
     aligned_free(val_query);
     aligned_free(mask_query);
     aligned_free(we_query);
