@@ -761,22 +761,17 @@ static int master_mask_read(
     int num_interrupts
 ) {
     unsigned data = 0;
-
     // Not writing to memory
     iowrite32(dev, 0x4C, data);
-
     // Set mask read address
     data = mask_rd_base;
     iowrite32(dev, 0x28, data);
-
     // Select decoder
     data = decoder;
     iowrite32(dev, 0x08, data);
-
     // Set number of words
     data = M - 1;
     iowrite32(dev, 0x40, data);
-
     // Start master mask read
     data = 0x01;
     iowrite32(dev, 0x04, data);
@@ -795,22 +790,17 @@ static int master_input_read(
     int num_interrupts
 ) {
     unsigned data = 0;
-
     // Not writing to memory
     iowrite32(dev, 0x4C, data);
-
     // Set base read address
     data = input_rd_base;
     iowrite32(dev, 0x30, data);
-
     // Set decoder
     data = decoder;
     iowrite32(dev, 0x08, data);
-
     // Set number of words
     data = M - 1;
     iowrite32(dev, 0x40, data);
-
     // Start master input read
     data = 0x03;
     iowrite32(dev, 0x04, data);
@@ -828,18 +818,14 @@ static int master_aux_read(
     int num_interrupts
 ) {
     unsigned data = 0;
-
     // Not writing to memory
     iowrite32(dev, 0x4C, data);
-
     // Set aux read base
     data = aux_rd_base;
     iowrite32(dev, 0x38, data);
-
     // Set number of words
     data = M - 1;
     iowrite32(dev, 0x44, data);
-
     // Start master aux read
     data = 0x05;
     iowrite32(dev, 0x04, data);
@@ -1351,8 +1337,8 @@ static struct mat *general_mat_mul(
                 smaller_output
             );
 
-            // Apply softmax
-            if (softmax) {
+            // Apply softmax only if a whole row can fit
+            if (softmax && N1_mat == N1) {
                 for (int i = 0; i < N0_mat; i ++) {
                     for (int j = 0; j < N1_mat / bits_in_bytes; j++) {
                         smaller_span_mask[i * N1_mat / bits_in_bytes + j] = span_mask[(i * N1) / bits_in_bytes + j];
@@ -1401,7 +1387,19 @@ static struct mat *general_mat_mul(
     return output;
 }
 
-static struct mat *EdgeBert_element_add(
+static struct mat *general_softmax(
+    struct esp_device *dev,
+    struct esp_device *plic_dev,
+    token_t *mem,
+    int N0,
+    int M_mat,
+    struct mat *mat1,
+    token_t *span_mask
+) {
+    // TODO
+}
+
+static void EdgeBert_element_add(
     struct esp_device *dev,
     struct esp_device *plic_dev,
     token_t *mem,
@@ -1409,7 +1407,8 @@ static struct mat *EdgeBert_element_add(
     int M_mat,
     struct mat *mat1,
     struct mat *mat2,
-    int write
+    int write,
+    struct mat *output
 ) {
     printf("...STARTing Element Add in EdgeBert...\n");
 
@@ -1475,18 +1474,18 @@ static struct mat *EdgeBert_element_add(
 
     // Write data outside
     if (write == 0) {
-        struct mat *output = write_matrix(
+        write_matrix(
             dev,
             plic_dev,
             mem,
             N0,
             M_mat,
+            output,
             num_interrupts
         );
         return output;
     }
     printf("...FINISHing Element Add in EdgeBert...\n");
-    return NULL;
 }
 
 // Apply layer norm
@@ -1496,7 +1495,8 @@ static struct mat *EdgeBert_layer_norm(
     token_t *mem,
     int N0,
     int M_mat,
-    struct mat *mat1
+    struct mat *mat1,
+    struct mat *output
 ) {
     printf("...STARTing Element Add in EdgeBert...\n");
 
@@ -1599,7 +1599,108 @@ static struct mat *general_element_add(
     int M_mat,
     struct mat *mat1,
     struct mat *mat2,
-    int write
+    int layer_norm
+) {
+    unsigned N0_tile;
+
+    // Try to get as many rows
+    N0_tile = mask_buffer_size * bits_in_bytes / (2 * N0);
+    N0_tile = (N0_tile / 16) * 16;
+    N0_tile = min(N0_tile, N0);
+
+    // Allocate memory for matrices
+    struct mat *left = aligned_malloc(sizeof(struct mat));
+    token_t *val_left = aligned_malloc(N0_tile * M_mat);
+    token_t *mask_left = aligned_malloc(N0_tile * M_mat / bits_in_bytes);
+    int bias_left = 0;
+    *left = (struct mat) {val_left, mask_left, bias_left};
+
+    struct mat *right = aligned_malloc(sizeof(struct mat));
+    token_t *val_right = aligned_malloc(N0_tile * M_mat);
+    token_t *mask_right = aligned_malloc(N0_tile * M_mat / bits_in_bytes);
+    int bias_right = 0;
+    *right = (struct mat) {val_right, mask_right, bias_right};
+
+    struct mat *smaller_output = aligned_malloc(sizeof(struct mat));
+    token_t *val_smaller_output = aligned_malloc(N0_tile * M_mat);
+    token_t *mask_smaller_output = aligned_malloc(N0_tile * M_mat / bits_in_bytes);
+    int bias_smaller_output = 0;
+    *smaller_output = (struct mat) {val_smaller_output, mask_smaller_output, bias_smaller_output};
+
+    struct mat *output = aligned_malloc(sizeof(struct mat));
+    token_t *val_output = aligned_malloc(N0 * M_mat);
+    token_t *mask_output = aligned_malloc(N0 * M_mat / bits_in_bytes);
+    int bias_ouptut = 0;
+    *output = (struct mat) {val_output, mask_output, bias_ouptut};
+
+    int row = 0;
+    while (row < N0) {
+        // Get left matrix
+        unsigned N0_mat = min(N0_tile, N0 - row);
+        memcpy(left -> values, mat1 -> values + M_mat * row, N0_mat * M_mat);
+        memcpy(left -> mask, mat1 -> mask + (M_mat * row / bits_in_bytes), N0_mat * M_mat / bits_in_bytes);
+
+        memcpy(right -> values, mat2 -> values + M_mat * row, N0_mat * M_mat);
+        memcpy(right -> mask, mat2 -> mask + (M_mat * row / bits_in_bytes), N0_mat * M_mat / bits_in_bytes);
+
+        // Add
+        EdgeBert_element_add(
+            dev,
+            plic_dev,
+            mem,
+            N0_mat,
+            M_mat,
+            left,
+            right,
+            layer_norm,
+            smaller_output
+        );
+
+        // Apply softmax
+        if (layer_norm) {
+            EdgeBert_layer_norm(
+                dev,
+                plic_dev,
+                mem,
+                N0_mat,
+                M_mat,
+                smaller_output,
+                smaller_output
+            );
+        }
+
+        // Copy over data into output
+        for (int i = 0; i < N0_mat; i++) {
+            for (int j = 0; j < M_mat; j++) {
+                output -> values[M_mat * (row + i) + j] = smaller_ouptut -> values[M_mat * i + j];
+            }
+        }
+
+        // Copy over mask into output
+        for (int i = 0; i < N0_mat; i++) {
+            for (int j = 0; j < M_mat / bits_in_bytes; j++) {
+                output -> mask[(M_mat * (row + i)) / bits_in_bytes + j] = smaller_ouptut -> mask[M_mat * i + j];
+            }
+        }
+        row += N0_mat;
+    }
+
+    aligned_free(val_left);
+    aligned_free(mask_left);
+    aligned_free(left);
+    aligned_free(val_right);
+    aligned_free(mask_right);
+    aligned_free(right);
+    aligned_free(val_smaller_output);
+    aligned_free(mask_smaller_output);
+    aligned_free(smaller_output);
+    return output;
+}
+
+static void general_layer_norm(
+    struct esp_device *dev,
+    struct esp_device *plic_dev,
+    token_t *mem
 ) {
     // TODO
 }
@@ -1649,7 +1750,7 @@ static struct mat *EdgeBert_pooler(
     unsigned is_relu = 0;
     unsigned is_bias = 0;
     unsigned weight_bias = 0;
-    unsigned write = 0;
+    unsigned softmax = 0;
 
     // Query multiplication
     struct mat* output = general_mat_mul(
@@ -1664,7 +1765,8 @@ static struct mat *EdgeBert_pooler(
         is_relu,
         is_bias,
         weight_bias,
-        write
+        softmax,
+        NULL
     );
 
     // Activation?
@@ -1719,7 +1821,7 @@ static token_t *EdgeBert_highway_exit(
     unsigned is_relu = 0;
     unsigned is_bias = 0;
     unsigned weight_bias = 0;
-    unsigned write = 0;
+    unsigned softmax = 0;
 
     // Perform matrix multiplication
     struct mat* output = general_mat_mul(
@@ -1734,7 +1836,8 @@ static token_t *EdgeBert_highway_exit(
         is_relu,
         is_bias,
         weight_bias,
-        write
+        softmax,
+        NULL
     );
 
     // Free memory
@@ -1817,7 +1920,7 @@ static token_t *EdgeBert_attention(
     unsigned is_relu = 0;
     unsigned is_bias = 0;
     unsigned weight_bias = 0;
-    unsigned write = 0;
+    unsigned softmax = 0;
 
     // Mutliply IDs by query matrix
     struct mat *mat_query = general_mat_mul(
@@ -1832,7 +1935,8 @@ static token_t *EdgeBert_attention(
         is_relu,
         is_bias,
         weight_bias,
-        write
+        softmax,
+        NULL
     );
 
     // Mutliply IDs by key matrix
@@ -1848,7 +1952,8 @@ static token_t *EdgeBert_attention(
         is_relu,
         is_bias,
         weight_bias,
-        write
+        softmax,
+        NULL
     );
 
     // Mutliply IDs by value matrix
@@ -1864,7 +1969,8 @@ static token_t *EdgeBert_attention(
         is_relu,
         is_bias,
         weight_bias,
-        write
+        softmax,
+        NULL
     );
 
     // Free inputs and weights
@@ -1893,10 +1999,10 @@ static token_t *EdgeBert_attention(
     M_mat = input_n;
     N1 = input_m;
     // Set softmax parameter to true
-    write = 1;
+    softmax = 1;
 
     // Multiply query and key outpput
-    general_mat_mul(
+    struct mat *mat_query_key = general_mat_mul(
         dev,
         plic_dev,
         mem,
@@ -1908,22 +2014,7 @@ static token_t *EdgeBert_attention(
         is_relu,
         is_bias,
         weight_bias,
-        write
-    );
-
-    // Softmax and attention span configuration
-    N0 = input_m;
-    M_mat = input_m;
-    N1 = input_m;
-
-    // Apply softmax
-    struct mat *mat_query_key = EdgeBert_atten_softmax(
-        dev,
-        plic_dev,
-        mem,
-        N0,
-        M_mat,
-        NULL,
+        softmax,
         span_mat
     );
 
@@ -1940,7 +2031,7 @@ static token_t *EdgeBert_attention(
     N0 = input_m;
     M_mat = input_m;
     N1 = hidden_size;
-    write = 0;
+    softmax = 0;
 
     struct mat *output = general_mat_mul(
         dev,
@@ -1954,7 +2045,8 @@ static token_t *EdgeBert_attention(
         is_relu,
         is_bias,
         weight_bias,
-        write
+        softmax,
+        NULL
     );
 
     // Free memory
@@ -2009,16 +2101,16 @@ static struct mat *EdgeBert_attention_heads(
         printf("...Attention Head %d takes %"PRIu64" clock cycles...\n", i, exe_cycle);
 
         // Copy over values
-        for (int l = 0; l < input_m; l++) {
+        for (int j = 0; j < input_m; j++) {
             for (int k = 0; k < hidden_size; k++) {
-                attention_heads -> values[hidden_size * num_heads * l + hidden_size * i + k] = head_output -> values[hidden_size * l + k];
+                attention_heads -> values[hidden_size * num_heads * j + hidden_size * i + k] = head_output -> values[hidden_size * j + k];
             }
         }
 
         // Copy over mask
-        for (int l = 0; l < input_m; l++) {
+        for (int j = 0; j < input_m; j++) {
             for (int k = 0; k < hidden_size / bits_in_bytes; k++) {
-                attention_heads -> mask[(hidden_size * num_heads * l + hidden_size * i) / bits_in_bytes + k] = head_output -> mask[hidden_size / bits_in_bytes * l + k];
+                attention_heads -> mask[(hidden_size * num_heads * j + hidden_size * i) / bits_in_bytes + k] = head_output -> mask[hidden_size / bits_in_bytes * j + k];
             }
         }
 
@@ -2066,7 +2158,7 @@ static struct mat *EdgeBert_processing(
     unsigned is_relu = 0;
     unsigned is_bias = 0;
     unsigned weight_bias = 0;
-    unsigned write = 0;
+    unsigned softmax = 0;
 
     struct mat *mat_output1 = general_mat_mul(
         dev,
@@ -2080,7 +2172,8 @@ static struct mat *EdgeBert_processing(
         is_relu,
         is_bias,
         weight_bias,
-        write
+        softmax,
+        NULL
     );
 
     // Free memory
@@ -2167,7 +2260,7 @@ static struct mat *EdgeBert_feed_forward(
     unsigned is_relu = 0;
     unsigned is_bias = 0;
     unsigned weight_bias = 0;
-    unsigned write = 0;
+    unsigned softmax = 0;
 
     struct mat *mat_output1 = general_mat_mul(
         dev,
@@ -2181,7 +2274,8 @@ static struct mat *EdgeBert_feed_forward(
         is_relu,
         is_bias,
         weight_bias,
-        write
+        softmax,
+        NULL
     );
 
     aligned_free(we_mat1 -> values);
@@ -2205,7 +2299,8 @@ static struct mat *EdgeBert_feed_forward(
         is_relu,
         is_bias,
         weight_bias,
-        write
+        softmax,
+        NULL
     );
 
     N0 = input_m;
