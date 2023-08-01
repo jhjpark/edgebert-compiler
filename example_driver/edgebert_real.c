@@ -218,7 +218,7 @@ void CPU_transpose(token_t *array, int m, int n) {
     }
 }
 
-void CPU_tranpose_mask(token_t *mask, int m, int n) {
+void CPU_transpose_mask(token_t *mask, int m, int n) {
     token_t new_mask[m * n / bits_in_bytes];
 
     for (int i = 0; i < m; i++) {
@@ -1302,7 +1302,7 @@ static struct mat *general_mat_mul(
 
     // Tranpose for easier access
     CPU_transpose(mat2 -> values, M_mat, N1);
-    CPU_tranpose_mask(mat2 -> mask, M_mat, N1);
+    CPU_transpose_mask(mat2 -> mask, M_mat, N1);
 
     int row = 0, col = 0;
     while (row < N0) {
@@ -1361,14 +1361,14 @@ static struct mat *general_mat_mul(
             // Copy over data into output
             for (int i = 0; i < N0_mat; i++) {
                 for (int j = 0; j < N1_mat; j++) {
-                    output -> values[N1 * (row + i) + col + j] = smaller_ouptut -> values[N1_mat * i + j];
+                    output -> values[N1 * (row + i) + col + j] = smaller_output -> values[N1_mat * i + j];
                 }
             }
 
             // Copy over mask into output
             for (int i = 0; i < N0_mat; i++) {
                 for (int j = 0; j < N1_mat / bits_in_bytes; j++) {
-                    output -> mask[(N1 * (row + i) + col) / bits_in_bytes + j] = smaller_ouptut -> mask[N1_mat / bits_in_bytes * i + j];
+                    output -> mask[(N1 * (row + i) + col) / bits_in_bytes + j] = smaller_output -> mask[N1_mat / bits_in_bytes * i + j];
                 }
             }
             col += N1_mat;
@@ -1410,7 +1410,7 @@ static void general_softmax(
     token_t *val_input = aligned_malloc(N0_tile * M_mat);
     token_t *mask_input = aligned_malloc(N0_tile * M_mat / bits_in_bytes);
     int bias_input = 0;
-    *input = (struct mat) {input, val_input, mask_input};
+    *input = (struct mat) {val_input, mask_input, bias_input};
 
     token_t *smaller_span_mask = aligned_malloc(N0_tile * M_mat / bits_in_bytes);
 
@@ -1460,7 +1460,7 @@ static void general_softmax(
     aligned_free(input);
 }
 
-// Apply element-wise addition
+// Apply element-wise addition (return in output)
 static void EdgeBert_element_add(
     struct esp_device *dev,
     struct esp_device *plic_dev,
@@ -1545,13 +1545,12 @@ static void EdgeBert_element_add(
             output,
             num_interrupts
         );
-        return output;
     }
     printf("...FINISHing Element Add in EdgeBert...\n");
 }
 
 // Apply layer norm
-static struct mat *EdgeBert_layer_norm(
+static void EdgeBert_layer_norm(
     struct esp_device *dev,
     struct esp_device *plic_dev,
     token_t *mem,
@@ -1640,17 +1639,17 @@ static struct mat *EdgeBert_layer_norm(
     num_interrupts = wait(plic_dev, num_interrupts);
 
     // Write output to outside
-    struct mat *output = write_matrix(
+    write_matrix(
         dev,
         plic_dev,
         mem,
         N0,
         M_mat,
+        output,
         num_interrupts
     );
 
     printf("...FINISHing Layer Norm in EdgeBert...\n");
-    return output;
 }
 
 // Performs element-wise addition with the possibility of applying layer normalizations (returns new pointer)
@@ -1772,7 +1771,7 @@ static void general_layer_norm(
     token_t *val_input = aligned_malloc(N0_tile * M_mat);
     token_t *mask_input = aligned_malloc(N0_tile * M_mat / bits_in_bytes);
     int bias_input = 0;
-    *input = (struct mat) {input, val_input, mask_input};
+    *input = (struct mat) {val_input, mask_input, bias_input};
 
     int row = 0;
     while (row < N0) {
@@ -1890,7 +1889,7 @@ static struct mat *EdgeBert_pooler(
     return output;
 }
 
-static token_t *EdgeBert_highway_exit(
+static struct mat *EdgeBert_highway_exit(
     struct esp_device *dev,
     struct esp_device *plic_dev,
     token_t *mem,
@@ -1960,7 +1959,7 @@ static token_t *EdgeBert_highway_exit(
 }
 
 // Attention head
-static token_t *EdgeBert_attention(
+static struct mat *EdgeBert_attention(
     struct esp_device *dev,
     struct esp_device *plic_dev,
     token_t *mem,
@@ -2329,7 +2328,7 @@ static struct mat *EdgeBert_feed_forward(
     struct esp_device *dev,
     struct esp_device *plic_dev,
     token_t *mem,
-    token_t *attention_head_out,
+    struct mat *attention_head_out,
     int input_m,
     int input_n,
     int hidden_size_ffn
