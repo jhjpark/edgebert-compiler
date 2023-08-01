@@ -1245,6 +1245,7 @@ static void EdgeBert_atten_softmax(
     printf("FINISHing attention softmax in EdgeBert...\n");
 }
 
+// Perform general matrix multiplication with possibility of softamx
 static struct mat *general_mat_mul(
     struct esp_device *dev,
     struct esp_device *plic_dev,
@@ -1387,7 +1388,8 @@ static struct mat *general_mat_mul(
     return output;
 }
 
-static struct mat *general_softmax(
+// Perform softamx on matrices that cannot fit on a decoder (in-place operation)
+static void general_softmax(
     struct esp_device *dev,
     struct esp_device *plic_dev,
     token_t *mem,
@@ -1396,9 +1398,69 @@ static struct mat *general_softmax(
     struct mat *mat1,
     token_t *span_mask
 ) {
-    // TODO
+    unsigned N0_tile;
+
+    // Try to get as many rows
+    N0_tile = mask_buffer_size * bits_in_bytes / (2 * N0);
+    N0_tile = (N0_tile / 16) * 16;
+    N0_tile = min(N0_tile, N0);
+
+    // Allocate memory for matrices
+    struct mat *input = aligned_malloc(sizeof(struct mat));
+    token_t *val_input = aligned_malloc(N0_tile * M_mat);
+    token_t *mask_input = aligned_malloc(N0_tile * M_mat / bits_in_bytes);
+    int bias_input = 0;
+    *input = (struct mat) {input, val_input, mask_input};
+
+    token_t *smaller_span_mask = aligned_malloc(N0_tile * M_mat / bits_in_bytes);
+
+    int row = 0;
+    while (row < N0) {
+        // Get input matrix
+        unsigned N0_mat = min(N0_tile, N0 - row);
+        memcpy(input -> values, mat1 -> values + M_mat * row, N0_mat * M_mat);
+        memcpy(input -> mask, mat1 -> mask + (M_mat * row / bits_in_bytes), N0_mat * M_mat / bits_in_bytes);
+
+        for (int i = 0; i < N0_mat; i ++) {
+            for (int j = 0; j < M_mat / bits_in_bytes; j++) {
+                smaller_span_mask[i * M_mat / bits_in_bytes + j] = span_mask[(i * M_mat) / bits_in_bytes + j];
+            }
+        }
+
+        // Apply softmax
+        EdgeBert_atten_softmax(
+            dev,
+            plic_dev,
+            mem,
+            N0_mat,
+            M_mat,
+            input,
+            smaller_span_mask,
+            input
+        );
+
+        // Copy over data into output
+        for (int i = 0; i < N0_mat; i++) {
+            for (int j = 0; j < M_mat; j++) {
+                mat1 -> values[M_mat * (row + i) + j] = input -> values[M_mat * i + j];
+            }
+        }
+
+        // Copy over mask into output
+        for (int i = 0; i < N0_mat; i++) {
+            for (int j = 0; j < M_mat / bits_in_bytes; j++) {
+                mat1 -> mask[(M_mat * (row + i)) / bits_in_bytes + j] = input -> mask[M_mat * i + j];
+            }
+        }
+        row += N0_mat;
+    }
+
+    aligned_free(val_input);
+    aligned_free(mask_input);
+    aligned_free(input);
 }
 
+// Apply element-wise addition
 static void EdgeBert_element_add(
     struct esp_device *dev,
     struct esp_device *plic_dev,
@@ -1591,6 +1653,7 @@ static struct mat *EdgeBert_layer_norm(
     return output;
 }
 
+// Performs element-wise addition with the possibility of applying layer normalizations (returns new pointer)
 static struct mat *general_element_add(
     struct esp_device *dev,
     struct esp_device *plic_dev,
@@ -1621,12 +1684,6 @@ static struct mat *general_element_add(
     int bias_right = 0;
     *right = (struct mat) {val_right, mask_right, bias_right};
 
-    struct mat *smaller_output = aligned_malloc(sizeof(struct mat));
-    token_t *val_smaller_output = aligned_malloc(N0_tile * M_mat);
-    token_t *mask_smaller_output = aligned_malloc(N0_tile * M_mat / bits_in_bytes);
-    int bias_smaller_output = 0;
-    *smaller_output = (struct mat) {val_smaller_output, mask_smaller_output, bias_smaller_output};
-
     struct mat *output = aligned_malloc(sizeof(struct mat));
     token_t *val_output = aligned_malloc(N0 * M_mat);
     token_t *mask_output = aligned_malloc(N0 * M_mat / bits_in_bytes);
@@ -1653,7 +1710,7 @@ static struct mat *general_element_add(
             left,
             right,
             layer_norm,
-            smaller_output
+            left
         );
 
         // Apply softmax
@@ -1664,22 +1721,22 @@ static struct mat *general_element_add(
                 mem,
                 N0_mat,
                 M_mat,
-                smaller_output,
-                smaller_output
+                left,
+                left
             );
         }
 
         // Copy over data into output
         for (int i = 0; i < N0_mat; i++) {
             for (int j = 0; j < M_mat; j++) {
-                output -> values[M_mat * (row + i) + j] = smaller_ouptut -> values[M_mat * i + j];
+                output -> values[M_mat * (row + i) + j] = left -> values[M_mat * i + j];
             }
         }
 
         // Copy over mask into output
         for (int i = 0; i < N0_mat; i++) {
             for (int j = 0; j < M_mat / bits_in_bytes; j++) {
-                output -> mask[(M_mat * (row + i)) / bits_in_bytes + j] = smaller_ouptut -> mask[M_mat * i + j];
+                output -> mask[(M_mat * (row + i)) / bits_in_bytes + j] = left -> mask[M_mat * i + j];
             }
         }
         row += N0_mat;
@@ -1691,18 +1748,69 @@ static struct mat *general_element_add(
     aligned_free(val_right);
     aligned_free(mask_right);
     aligned_free(right);
-    aligned_free(val_smaller_output);
-    aligned_free(mask_smaller_output);
-    aligned_free(smaller_output);
     return output;
 }
 
+// Performs layer norm for matrices that cannot fit in decoder (in-place operation)
 static void general_layer_norm(
     struct esp_device *dev,
     struct esp_device *plic_dev,
-    token_t *mem
+    token_t *mem,
+    int N0,
+    int M_mat,
+    struct mat *mat1
 ) {
-    // TODO
+    unsigned N0_tile;
+
+    // Try to get as many rows
+    N0_tile = mask_buffer_size * bits_in_bytes / (2 * N0);
+    N0_tile = (N0_tile / 16) * 16;
+    N0_tile = min(N0_tile, N0);
+
+    // Allocate memory for matrices
+    struct mat *input = aligned_malloc(sizeof(struct mat));
+    token_t *val_input = aligned_malloc(N0_tile * M_mat);
+    token_t *mask_input = aligned_malloc(N0_tile * M_mat / bits_in_bytes);
+    int bias_input = 0;
+    *input = (struct mat) {input, val_input, mask_input};
+
+    int row = 0;
+    while (row < N0) {
+        // Get input matrix
+        unsigned N0_mat = min(N0_tile, N0 - row);
+        memcpy(input -> values, mat1 -> values + M_mat * row, N0_mat * M_mat);
+        memcpy(input -> mask, mat1 -> mask + (M_mat * row / bits_in_bytes), N0_mat * M_mat / bits_in_bytes);
+
+        // Add
+        EdgeBert_layer_norm(
+            dev,
+            plic_dev,
+            mem,
+            N0_mat,
+            M_mat,
+            input,
+            input
+        );
+
+        // Copy over data into output
+        for (int i = 0; i < N0_mat; i++) {
+            for (int j = 0; j < M_mat; j++) {
+                mat1 -> values[M_mat * (row + i) + j] = input -> values[M_mat * i + j];
+            }
+        }
+
+        // Copy over mask into output
+        for (int i = 0; i < N0_mat; i++) {
+            for (int j = 0; j < M_mat / bits_in_bytes; j++) {
+                mat1 -> mask[(M_mat * (row + i)) / bits_in_bytes + j] = input -> mask[M_mat * i + j];
+            }
+        }
+        row += N0_mat;
+    }
+
+    aligned_free(val_input);
+    aligned_free(mask_input);
+    aligned_free(input);
 }
 
 static void EdgeBert_entropy(
@@ -2197,7 +2305,8 @@ static struct mat *EdgeBert_processing(
 
     N0 = input_m, M_mat = input_n;
 
-    // TODO: Fix
+    // Add and layer norm
+    unsigned layer_norm = 1;
     struct mat *output = general_element_add(
         dev,
         plic_dev,
@@ -2206,7 +2315,7 @@ static struct mat *EdgeBert_processing(
         M_mat,
         input,
         mat_output1,
-        write
+        layer_norm
     );
     count2 = get_counter();
     printf("FINISHing 12 Attention Heads Processing...\n");
@@ -2306,8 +2415,8 @@ static struct mat *EdgeBert_feed_forward(
     N0 = input_m;
     M_mat = input_n;
 
-    // TODO: Fix
     // Add attention output
+    unsigned layer_norm = 1;
     struct mat *output = general_element_add(
         dev,
         plic_dev,
@@ -2316,7 +2425,7 @@ static struct mat *EdgeBert_feed_forward(
         M_mat,
         attention_head_out,
         mat_output2,
-        write
+        layer_norm
     );
 
     // Free memory
