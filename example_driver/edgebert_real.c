@@ -199,7 +199,8 @@ void CPU_multiply(int *a, int *b, int N0, int M_mat, int N1, int *d) {
 // CPU functions for EdgeBert
 // Transpose a matrix of chars at array with original size m x n (in-place)
 void CPU_transpose(token_t *array, int m, int n) {
-    token_t new_array[m * n];
+    token_t *new_array = aligned_malloc(m * n);
+
     for (int i = 0; i < m; i++) {
         for (int j = 0; j < n; j++) {
             // Index in the original matrix
@@ -218,7 +219,7 @@ void CPU_transpose(token_t *array, int m, int n) {
 }
 
 void CPU_transpose_mask(token_t *mask, int m, int n) {
-    token_t new_mask[m * n / bits_in_bytes];
+    token_t *new_mask = aligned_malloc(m * n / bits_in_bytes);
 
     for (int i = 0; i < m; i++) {
         for (int j = 0; j < n; j++) {
@@ -227,7 +228,7 @@ void CPU_transpose_mask(token_t *mask, int m, int n) {
             int mask_idx2 = (j * m + i) / 8;
             int offset2 = (j * m + i) % 8;
 
-            new_mask[mask_idx2] += ((mask[mask_idx1] >> offset1) & 1) << offset2;
+            new_mask[mask_idx2] |= ((mask[mask_idx1] >> offset1) & 1) << offset2;
         }
     }
 
@@ -1180,12 +1181,6 @@ static void EdgeBert_atten_softmax(
     data = 0x02;
     iowrite32(dev, 0x54, data);
 
-    // Configure matrix size
-    data = 0x0;
-    data += N0;
-    data += M_mat << 20;
-    iowrite32(dev, 0x10, data);
-
     // Configure parameters
     int base_attn_span = 0;
     int adpbias_attn_span = 0;
@@ -1205,6 +1200,12 @@ static void EdgeBert_atten_softmax(
     data += num_timestep << 8;
     data += adpbias_act1 << 16;
     iowrite32(dev, 0x20, data);
+
+    // Configure matrix size
+    data = 0x0;
+    data += N0;
+    data += M_mat << 20;
+    iowrite32(dev, 0x10, data);
 
     // Set base of matrix
     data = 0;
@@ -1272,17 +1273,19 @@ static struct mat *general_mat_mul(
     N0_tile = (N0_tile / 16) * 16;
     N0_tile = min(N0_tile, N0);
 
+    printf("Tiles: %d %d\n", N0_tile, N1_tile);
+
     // Allocate memory for matrices
     struct mat *left = aligned_malloc(sizeof(struct mat));
     token_t *val_left = aligned_malloc(N0_tile * M_mat);
     token_t *mask_left = aligned_malloc(N0_tile * M_mat / bits_in_bytes);
-    int bias_left = 0;
+    int bias_left = mat1 -> bias;
     *left = (struct mat) {val_left, mask_left, bias_left};
 
     struct mat *right = aligned_malloc(sizeof(struct mat));
     token_t *val_right = aligned_malloc(M_mat * N1_tile);
     token_t *mask_right = aligned_malloc(M_mat * N1_tile / bits_in_bytes);
-    int bias_right = 0;
+    int bias_right = mat2 -> bias;
     *right = (struct mat) {val_right, mask_right, bias_right};
 
     struct mat *smaller_output = aligned_malloc(sizeof(struct mat));
@@ -1299,18 +1302,23 @@ static struct mat *general_mat_mul(
 
     token_t *smaller_span_mask = aligned_malloc(N0_tile * N1_tile / bits_in_bytes);
 
+    printf("CHECKPOINT!\n");
     // Tranpose for easier access
     CPU_transpose(mat2 -> values, M_mat, N1);
+    printf("CHECKPOINT 2!\n");
     CPU_transpose_mask(mat2 -> mask, M_mat, N1);
+    printf("CHECKPOINT 3!\n");
 
     int row = 0, col = 0;
     while (row < N0) {
+        printf("ITERATION ROW\n");
         // Get left matrix
         unsigned N0_mat = min(N0_tile, N0 - row);
         memcpy(left -> values, mat1 -> values + M_mat * row, N0_mat * M_mat);
         memcpy(left -> mask, mat1 -> mask + (M_mat * row / bits_in_bytes), N0_mat * M_mat / bits_in_bytes);
 
         while (col < N1) {
+            printf("ITERATION COLUMN\n");
             // Get right matrix
             unsigned N1_mat = min(N1_tile, N1 - col);
             memcpy(right -> values, mat2 -> values + M_mat * col, N1_mat * M_mat);
@@ -1408,7 +1416,7 @@ static void general_softmax(
     struct mat *input = aligned_malloc(sizeof(struct mat));
     token_t *val_input = aligned_malloc(N0_tile * M_mat);
     token_t *mask_input = aligned_malloc(N0_tile * M_mat / bits_in_bytes);
-    int bias_input = 0;
+    int bias_input = mat1 -> bias;
     *input = (struct mat) {val_input, mask_input, bias_input};
 
     token_t *smaller_span_mask = aligned_malloc(N0_tile * M_mat / bits_in_bytes);
@@ -1526,6 +1534,10 @@ static void EdgeBert_element_add(
     // Set offset
     data = 0;
     iowrite32(dev, 0x18, data);
+    // Set base output
+    data = 0;
+    data += input_buffer_size - N0 * M_mat;
+    iowrite32(dev, 0x48, data);
 
     // Start element-wise addition
     data = 0xA;
@@ -1556,6 +1568,10 @@ static void EdgeBert_layer_norm(
     int N0,
     int M_mat,
     struct mat *mat1,
+    int base_gamma,
+    int adpbias_gamma,
+    int base_beta,
+    int adpbias_beta,
     struct mat *output
 ) {
     printf("...STARTing Element Add in EdgeBert...\n");
@@ -1590,10 +1606,6 @@ static void EdgeBert_layer_norm(
     iowrite32(dev, 0x54, data);
 
     // Set layer norm configs
-    int base_gamma = 1;
-    int adpbias_gamma = 0;
-    int base_beta = 0;
-    int adpbias_beta = 0;
     data = 0;
     data += base_gamma << 7;
     data += base_beta << 15;
@@ -1660,7 +1672,11 @@ static struct mat *general_element_add(
     int M_mat,
     struct mat *mat1,
     struct mat *mat2,
-    int layer_norm
+    int layer_norm,
+    int base_gamma,
+    int adpbias_gamma,
+    int base_beta,
+    int adpbias_beta
 ) {
     unsigned N0_tile;
 
@@ -1673,13 +1689,13 @@ static struct mat *general_element_add(
     struct mat *left = aligned_malloc(sizeof(struct mat));
     token_t *val_left = aligned_malloc(N0_tile * M_mat);
     token_t *mask_left = aligned_malloc(N0_tile * M_mat / bits_in_bytes);
-    int bias_left = 0;
+    int bias_left = mat1 -> bias;
     *left = (struct mat) {val_left, mask_left, bias_left};
 
     struct mat *right = aligned_malloc(sizeof(struct mat));
     token_t *val_right = aligned_malloc(N0_tile * M_mat);
     token_t *mask_right = aligned_malloc(N0_tile * M_mat / bits_in_bytes);
-    int bias_right = 0;
+    int bias_right = mat2 -> bias;
     *right = (struct mat) {val_right, mask_right, bias_right};
 
     struct mat *output = aligned_malloc(sizeof(struct mat));
@@ -1720,6 +1736,10 @@ static struct mat *general_element_add(
                 N0_mat,
                 M_mat,
                 left,
+                base_gamma,
+                adpbias_gamma,
+                base_beta,
+                adpbias_beta,
                 left
             );
         }
@@ -1756,7 +1776,11 @@ static void general_layer_norm(
     token_t *mem,
     int N0,
     int M_mat,
-    struct mat *mat1
+    struct mat *mat1,
+    int base_gamma,
+    int adpbias_gamma,
+    int base_beta,
+    int adpbias_beta
 ) {
     unsigned N0_tile;
 
@@ -1769,7 +1793,7 @@ static void general_layer_norm(
     struct mat *input = aligned_malloc(sizeof(struct mat));
     token_t *val_input = aligned_malloc(N0_tile * M_mat);
     token_t *mask_input = aligned_malloc(N0_tile * M_mat / bits_in_bytes);
-    int bias_input = 0;
+    int bias_input = mat1 -> bias;
     *input = (struct mat) {val_input, mask_input, bias_input};
 
     int row = 0;
@@ -1787,6 +1811,10 @@ static void general_layer_norm(
             N0_mat,
             M_mat,
             input,
+            base_gamma,
+            adpbias_gamma,
+            base_beta,
+            adpbias_beta,
             input
         );
 
@@ -2098,7 +2126,7 @@ static struct mat *EdgeBert_attention(
 
     // Transpose output of key multiplication
     CPU_transpose(mat_key -> values, N0, N1);
-    CPU_transpose(mat_key -> mask, N0, N1 / bits_in_bytes);
+    CPU_transpose_mask(mat_key -> mask, N0, N1);
 
     // Matrix config
     N0 = input_m;
@@ -2343,7 +2371,11 @@ static struct mat *EdgeBert_processing(
         M_mat,
         input,
         mat_output1,
-        layer_norm
+        layer_norm,
+        1,
+        0,
+        0,
+        0
     );
     count2 = get_counter();
     printf("FINISHing 12 Attention Heads Processing...\n");
@@ -2453,7 +2485,11 @@ static struct mat *EdgeBert_feed_forward(
         M_mat,
         attention_head_out,
         mat_output2,
-        layer_norm
+        layer_norm,
+        1,
+        0,
+        0,
+        0
     );
 
     // Free memory
@@ -2534,7 +2570,7 @@ static void EdgeBert_debugging_matmul(
     token_t *mem
 ) {
     int num_interrupts = 0;
-    int N0 = 16, M_mat = 16, N1 = 16;
+    int N0 = 128, M_mat = 768, N1 = 768;
 
     // Initialize weights
     struct mat *we_mat1 = aligned_malloc(sizeof(struct mat));
@@ -2549,11 +2585,11 @@ static void EdgeBert_debugging_matmul(
     int bias_input = 0;
     *input = (struct mat) {val_input, mask_input, bias_input};
 
-    struct mat *output = aligned_malloc(sizeof(struct mat));
-    token_t *val_output = aligned_malloc(N0 * N1);
-    token_t *mask_output = aligned_malloc(N0 * N1 / bits_in_bytes);
-    int bias_ouptut = 0;
-    *output = (struct mat) {val_output, mask_output, bias_ouptut};
+    // struct mat *output = aligned_malloc(sizeof(struct mat));
+    // token_t *val_output = aligned_malloc(N0 * N1);
+    // token_t *mask_output = aligned_malloc(N0 * N1 / bits_in_bytes);
+    // int bias_ouptut = 0;
+    // *output = (struct mat) {val_output, mask_output, bias_ouptut};
 
     // Load dummy data
     memset(val_mat1, 0b01001001, N0 * M_mat);
@@ -2562,7 +2598,7 @@ static void EdgeBert_debugging_matmul(
     memset(mask_input, 255, M_mat * N1 / bits_in_bytes);
 
     EdgeBert_init(dev, plic_dev, mem);
-    EdgeBert_mat_mul(
+    struct mat* output = general_mat_mul(
         dev,
         plic_dev,
         mem,
@@ -2575,18 +2611,18 @@ static void EdgeBert_debugging_matmul(
         0,
         0,
         0,
-        output
+        NULL
     );
 
-    printf("matmul output values\n");
-    for (int i = 0; i < N0 * N1; i++) {
-        printf("%d %d\n", i, output -> values[i]);
-    }
+    // printf("matmul output values\n");
+    // for (int i = 0; i < N0 * N1; i++) {
+    //     printf("%d %d\n", i, output -> values[i]);
+    // }
 
-    printf("matmul output mask\n");
-    for (int i = 0; i < N0 * N1 / bits_in_bytes; i++) {
-        printf("%d %d\n", i, output -> mask[i]);
-    }
+    // printf("matmul output mask\n");
+    // for (int i = 0; i < N0 * N1 / bits_in_bytes; i++) {
+    //     printf("%d %d\n", i, output -> mask[i]);
+    // }
 
     aligned_free(val_mat1);
     aligned_free(mask_mat1);
@@ -2594,8 +2630,8 @@ static void EdgeBert_debugging_matmul(
     aligned_free(val_input);
     aligned_free(mask_input);
     aligned_free(input);
-    aligned_free(val_output);
-    aligned_free(mask_output);
+    aligned_free(output -> values);
+    aligned_free(output -> mask);
     aligned_free(output);
 }
 
@@ -2759,6 +2795,10 @@ static void EdgeBert_debugging_layer_norm(
         N0,
         M_mat,
         we_mat1,
+        1,
+        0,
+        0,
+        0,
         output
     );
 
@@ -2850,7 +2890,7 @@ int main(int argc, char * argv[]) {
     //     3072
     // );
 
-    EdgeBert_debugging_softmax(&dev, &plic_dev, mem);
+    EdgeBert_debugging_matmul(&dev, &plic_dev, mem);
 
     printf("FINISHing DRIVER\n");
     aligned_free(mem);
