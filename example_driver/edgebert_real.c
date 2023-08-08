@@ -29,7 +29,7 @@ struct mat {
     token_t *mask;
     int bias;
 };
-const int bits_in_bytes = 8;
+const int bits_in_bytes = 4;
 
 // Get direct memory access (DMA) per beat
 static unsigned DMA_WORD_PER_BEAT(unsigned _st) {
@@ -1054,7 +1054,7 @@ static void EdgeBert_mat_mul(
     struct mat *output
 ) {
     printf("...STARTing matmul in EdgeBert...\n");
-
+    Edgebert_init(dev, plic_dev, mem);
     int num_interrupts = 0;
     unsigned data = 0;
 
@@ -1144,7 +1144,7 @@ static void EdgeBert_atten_softmax(
     struct mat *output
 ) {
     printf("STARTing attention softmax in EdgeBert...\n");
-
+    Edgebert_init(dev, plic_dev, mem);
     int num_interrupts = 0;
     unsigned data = 0;
 
@@ -1319,14 +1319,21 @@ static struct mat *general_mat_mul(
 
         while (col < N1) {
             printf("ITERATION COLUMN\n");
+            printf("POSITION: %d %d\n", row, col);
             // Get right matrix
             unsigned N1_mat = min(N1_tile, N1 - col);
+            printf("DIMENSIONS: %d %d\n", N0_mat, N1_mat);
+            printf("Checkpoint 1!\n");
             memcpy(right -> values, mat2 -> values + M_mat * col, N1_mat * M_mat);
+            printf("Checkpoint 2!\n");
             memcpy(right -> mask, mat2 -> mask + (M_mat * col / bits_in_bytes), N1_mat * M_mat / bits_in_bytes);
 
             // Transpose back
+            printf("Checkpoint 3!\n");
             CPU_transpose(right -> values, N1_mat, M_mat);
+            printf("Checkpoint 4!\n");
             CPU_transpose_mask(right -> mask, N1_mat, M_mat);
+            printf("Checkpoint 5!\n");
 
             // Multiply
             EdgeBert_mat_mul(
@@ -1480,7 +1487,7 @@ static void EdgeBert_element_add(
     struct mat *output
 ) {
     printf("...STARTing Element Add in EdgeBert...\n");
-
+    Edgebert_init(dev, plic_dev, mem);
     int num_interrupts = 0;
     num_interrupts = load_matrices(
         dev,
@@ -1575,7 +1582,7 @@ static void EdgeBert_layer_norm(
     struct mat *output
 ) {
     printf("...STARTing Element Add in EdgeBert...\n");
-
+    Edgebert_init(dev, plic_dev, mem);
     int num_interrupts = 0;
     unsigned data = 0;
 
@@ -2610,7 +2617,7 @@ static void EdgeBert_debugging_matmul(
     token_t *mem
 ) {
     int num_interrupts = 0;
-    int N0 = 64, M_mat = 768, N1 = 64;
+    int N0 = 64, M_mat = 768, N1 = 80;
 
     // Initialize weights
     struct mat *we_mat1 = aligned_malloc(sizeof(struct mat));
@@ -2625,11 +2632,11 @@ static void EdgeBert_debugging_matmul(
     int bias_input = 0;
     *input = (struct mat) {val_input, mask_input, bias_input};
 
-    struct mat *output = aligned_malloc(sizeof(struct mat));
-    token_t *val_output = aligned_malloc(N0 * N1);
-    token_t *mask_output = aligned_malloc(N0 * N1 / bits_in_bytes);
-    int bias_ouptut = 0;
-    *output = (struct mat) {val_output, mask_output, bias_ouptut};
+    // struct mat *output = aligned_malloc(sizeof(struct mat));
+    // token_t *val_output = aligned_malloc(N0 * N1);
+    // token_t *mask_output = aligned_malloc(N0 * N1 / bits_in_bytes);
+    // int bias_ouptut = 0;
+    // *output = (struct mat) {val_output, mask_output, bias_ouptut};
 
     // Load dummy data
     memset(val_mat1, 0b01001001, N0 * M_mat);
@@ -2638,7 +2645,7 @@ static void EdgeBert_debugging_matmul(
     memset(mask_input, 255, M_mat * N1 / bits_in_bytes);
 
     EdgeBert_init(dev, plic_dev, mem);
-    EdgeBert_mat_mul(
+    struct mat *output = general_mat_mul(
         dev,
         plic_dev,
         mem,
@@ -2651,7 +2658,7 @@ static void EdgeBert_debugging_matmul(
         0,
         0,
         0,
-        output
+        NULL
     );
 
     // printf("matmul output values\n");
@@ -2670,12 +2677,12 @@ static void EdgeBert_debugging_matmul(
     aligned_free(val_input);
     aligned_free(mask_input);
     aligned_free(input);
-    // aligned_free(output -> values);
-    // aligned_free(output -> mask);
-    // aligned_free(output);
     aligned_free(output -> values);
     aligned_free(output -> mask);
     aligned_free(output);
+    // aligned_free(output -> values);
+    // aligned_free(output -> mask);
+    // aligned_free(output);
 }
 
 static void EdgeBert_debugging_softmax(
