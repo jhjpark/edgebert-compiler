@@ -29,7 +29,7 @@ struct mat {
     token_t *mask;
     int bias;
 };
-const int bits_in_bytes = 4;
+const int bits_in_bytes = 8;
 
 // Get direct memory access (DMA) per beat
 static unsigned DMA_WORD_PER_BEAT(unsigned _st) {
@@ -930,6 +930,7 @@ static int load_matrix(
     // Master mask read (load from outside and store in accelerator MASK scratchpad) for decoder 0
     num_interrupts = master_mask_read(dev, plic_dev, mask_rd_base + mask_offset, decoder, M, num_interrupts);
     // Load in data to decoder 0
+    M = M / bits_in_bytes;
     num_interrupts = master_input_read(dev, plic_dev, input_rd_base + input_offset, decoder, M, num_interrupts);
     return num_interrupts;
 }
@@ -992,6 +993,7 @@ static struct mat *write_matrix(
     int M = N1 / vector_size;
     num_interrupts = master_input_write(dev, plic_dev, M, num_interrupts);
     memcpy(output -> values, mem + 2 * mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1);
+    M = M / bits_in_bytes;
     num_interrupts = master_mask_write(dev, plic_dev, M, num_interrupts);
     memcpy(output -> mask, mem + 2 * mask_buffer_size + 3 * input_buffer_size + aux_buffer_size, N0 * N1 / bits_in_bytes);
 
@@ -2376,7 +2378,6 @@ static struct mat *EdgeBert_feed_forward(
     uint64_t exe_cycle;
 
     count1 = get_counter();
-    printf("CHECKPOINT 1!\n");
     // Initialize weights
     struct mat *we_mat1 = aligned_malloc(sizeof(struct mat));
     token_t *val_mat1 = aligned_malloc(input_n * hidden_size_ffn);
@@ -2406,7 +2407,6 @@ static struct mat *EdgeBert_feed_forward(
     unsigned weight_bias = 0;
     unsigned softmax = 0;
 
-    printf("CHECKPOINT 2!\n");
     struct mat *mat_output1 = general_mat_mul(
         dev,
         plic_dev,
@@ -2432,7 +2432,6 @@ static struct mat *EdgeBert_feed_forward(
     M_mat = hidden_size_ffn;
     N1 = input_n;
 
-    printf("CHECKPOINT 3!\n");
     struct mat *mat_output2 = general_mat_mul(
         dev,
         plic_dev,
@@ -2452,7 +2451,6 @@ static struct mat *EdgeBert_feed_forward(
     N0 = input_m;
     M_mat = input_n;
 
-    printf("CHECKPOINT 4!\n");
     // Add attention output
     unsigned layer_norm = 1;
     struct mat *output = general_element_add(
@@ -2903,7 +2901,7 @@ int main(int argc, char * argv[]) {
     //     3072
     // );
 
-    // // Run transformer on accelerator
+    // Run transformer on accelerator
     EdgeBert_transformer_layers(
         &dev,
         &plic_dev,
