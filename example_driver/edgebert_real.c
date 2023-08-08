@@ -216,6 +216,7 @@ void CPU_transpose(token_t *array, int m, int n) {
     for (int i = 0; i < m * n; i++) {
         array[i] = new_array[i];
     }
+    aligned_free(new_array);
 }
 
 void CPU_transpose_mask(token_t *mask, int m, int n) {
@@ -236,6 +237,7 @@ void CPU_transpose_mask(token_t *mask, int m, int n) {
     for (int i = 0; i < m * n / bits_in_bytes; i++) {
         mask[i] = new_mask[i];
     }
+    aligned_free(new_mask);
 }
 
 // Decode a m x n matrix by returning full array
@@ -739,14 +741,13 @@ static int validate_buf(token_t *out, native_t *gold, int out_len) {
 // Helper functions
 // Wait for interrupt
 static int wait(struct esp_device *plic_dev, int num_interrupts) {
-    printf("......waiting for interrupt #%d\n", num_interrupts + 1);
-    // iointerrupt();
+    // printf("......waiting for interrupt #%d\n", num_interrupts + 1);
     while((ioread32(plic_dev, PLIC_IP_OFFSET) & 0x40) == 0);
     iowrite32(plic_dev, PLIC_INTACK_OFFSET, EDGEBERT_IRQ + 1);
     iowrite32(plic_dev, 0x2000, 0x40);
     iowrite32(plic_dev, 0x18, 0x2);
     ioread32(plic_dev, PLIC_INTACK_OFFSET);
-    printf("......receiving for interrupt #%d\n", num_interrupts + 1);
+    // printf("......receiving for interrupt #%d\n", num_interrupts + 1);
     return num_interrupts + 1;
 }
 
@@ -1004,8 +1005,6 @@ static int EdgeBert_init(
     struct esp_device *plic_dev,
     token_t *mem
 ) {
-    printf("...STARTing base addr setting for EdgeBert...\n");
-
     // TODO: Our reset hack
     unsigned data = 0;
     iowrite32(dev, 0x00, 1);
@@ -1033,8 +1032,6 @@ static int EdgeBert_init(
     // Set aux write address
     data = aux_wr_base;
     iowrite32(dev, 0x3C, data);
-
-    printf("...FINISHing base addr setting for EdgeBert...\n");
 }
 
 // Matrix multiplication
@@ -1053,8 +1050,7 @@ static void EdgeBert_mat_mul(
     int write,
     struct mat *output
 ) {
-    printf("...STARTing matmul in EdgeBert...\n");
-    Edgebert_init(dev, plic_dev, mem);
+    EdgeBert_init(dev, plic_dev, mem);
     int num_interrupts = 0;
     unsigned data = 0;
 
@@ -1129,7 +1125,6 @@ static void EdgeBert_mat_mul(
             num_interrupts
         );
     }
-    printf("...FINISHing Matmul in EdgeBert...\n");
 }
 
 // Softmax for attention head
@@ -1143,8 +1138,7 @@ static void EdgeBert_atten_softmax(
     token_t *span_mask,
     struct mat *output
 ) {
-    printf("STARTing attention softmax in EdgeBert...\n");
-    Edgebert_init(dev, plic_dev, mem);
+    EdgeBert_init(dev, plic_dev, mem);
     int num_interrupts = 0;
     unsigned data = 0;
 
@@ -1241,8 +1235,6 @@ static void EdgeBert_atten_softmax(
         output,
         num_interrupts
     );
-
-    printf("FINISHing attention softmax in EdgeBert...\n");
 }
 
 // Perform general matrix multiplication with possibility of softamx
@@ -1273,8 +1265,6 @@ static struct mat *general_mat_mul(
     N0_tile = (N0_tile / 16) * 16;
     N0_tile = min(N0_tile, N0);
 
-    printf("Tiles: %d %d\n", N0_tile, N1_tile);
-
     // Allocate memory for matrices
     struct mat *left = aligned_malloc(sizeof(struct mat));
     token_t *val_left = aligned_malloc(N0_tile * M_mat);
@@ -1302,38 +1292,26 @@ static struct mat *general_mat_mul(
 
     token_t *smaller_span_mask = aligned_malloc(N0_tile * N1_tile / bits_in_bytes);
 
-    printf("CHECKPOINT!\n");
     // Tranpose for easier access
     CPU_transpose(mat2 -> values, M_mat, N1);
-    printf("CHECKPOINT 2!\n");
     CPU_transpose_mask(mat2 -> mask, M_mat, N1);
-    printf("CHECKPOINT 3!\n");
 
     int row = 0, col = 0;
     while (row < N0) {
-        printf("ITERATION ROW\n");
         // Get left matrix
         unsigned N0_mat = min(N0_tile, N0 - row);
         memcpy(left -> values, mat1 -> values + M_mat * row, N0_mat * M_mat);
         memcpy(left -> mask, mat1 -> mask + (M_mat * row / bits_in_bytes), N0_mat * M_mat / bits_in_bytes);
 
         while (col < N1) {
-            printf("ITERATION COLUMN\n");
-            printf("POSITION: %d %d\n", row, col);
             // Get right matrix
             unsigned N1_mat = min(N1_tile, N1 - col);
-            printf("DIMENSIONS: %d %d\n", N0_mat, N1_mat);
-            printf("Checkpoint 1!\n");
             memcpy(right -> values, mat2 -> values + M_mat * col, N1_mat * M_mat);
-            printf("Checkpoint 2!\n");
             memcpy(right -> mask, mat2 -> mask + (M_mat * col / bits_in_bytes), N1_mat * M_mat / bits_in_bytes);
 
             // Transpose back
-            printf("Checkpoint 3!\n");
             CPU_transpose(right -> values, N1_mat, M_mat);
-            printf("Checkpoint 4!\n");
             CPU_transpose_mask(right -> mask, N1_mat, M_mat);
-            printf("Checkpoint 5!\n");
 
             // Multiply
             EdgeBert_mat_mul(
@@ -1486,8 +1464,7 @@ static void EdgeBert_element_add(
     int write,
     struct mat *output
 ) {
-    printf("...STARTing Element Add in EdgeBert...\n");
-    Edgebert_init(dev, plic_dev, mem);
+    EdgeBert_init(dev, plic_dev, mem);
     int num_interrupts = 0;
     num_interrupts = load_matrices(
         dev,
@@ -1564,7 +1541,6 @@ static void EdgeBert_element_add(
             num_interrupts
         );
     }
-    printf("...FINISHing Element Add in EdgeBert...\n");
 }
 
 // Apply layer norm
@@ -1581,8 +1557,7 @@ static void EdgeBert_layer_norm(
     int adpbias_beta,
     struct mat *output
 ) {
-    printf("...STARTing Element Add in EdgeBert...\n");
-    Edgebert_init(dev, plic_dev, mem);
+    EdgeBert_init(dev, plic_dev, mem);
     int num_interrupts = 0;
     unsigned data = 0;
 
@@ -1666,8 +1641,6 @@ static void EdgeBert_layer_norm(
         output,
         num_interrupts
     );
-
-    printf("...FINISHing Layer Norm in EdgeBert...\n");
 }
 
 // Performs element-wise addition with the possibility of applying layer normalizations (returns new pointer)
@@ -2262,7 +2235,7 @@ static struct mat *EdgeBert_attention_heads(
         );
         count2 = get_counter();
         exe_cycle = count2 - count1;
-        printf("...Attention Head %d takes %"PRIu64" clock cycles...\n", i, exe_cycle);
+        printf("...Attention Head %d takes %"PRIu64" clock cycles...\n", i + 1, exe_cycle);
 
         // Copy over values
         for (int j = 0; j < input_m; j++) {
@@ -2309,6 +2282,8 @@ static struct mat *EdgeBert_processing(
     struct mat *we_mat1 = aligned_malloc(sizeof(struct mat));
     token_t* val_mat1 = aligned_malloc(num_heads * hidden_size * input_n);
     token_t *mask_mat1 = aligned_malloc(num_heads * hidden_size * input_n / bits_in_bytes);
+    int bias_mat1 = 0;
+    *we_mat1 = (struct mat) {val_mat1, mask_mat1, bias_mat1};
 
     // Fill with dummy data
     // EdgeBert_init_buf_processing(we_mat1);
@@ -2401,7 +2376,7 @@ static struct mat *EdgeBert_feed_forward(
     uint64_t exe_cycle;
 
     count1 = get_counter();
-
+    printf("CHECKPOINT 1!\n");
     // Initialize weights
     struct mat *we_mat1 = aligned_malloc(sizeof(struct mat));
     token_t *val_mat1 = aligned_malloc(input_n * hidden_size_ffn);
@@ -2431,6 +2406,7 @@ static struct mat *EdgeBert_feed_forward(
     unsigned weight_bias = 0;
     unsigned softmax = 0;
 
+    printf("CHECKPOINT 2!\n");
     struct mat *mat_output1 = general_mat_mul(
         dev,
         plic_dev,
@@ -2456,6 +2432,7 @@ static struct mat *EdgeBert_feed_forward(
     M_mat = hidden_size_ffn;
     N1 = input_n;
 
+    printf("CHECKPOINT 3!\n");
     struct mat *mat_output2 = general_mat_mul(
         dev,
         plic_dev,
@@ -2475,6 +2452,7 @@ static struct mat *EdgeBert_feed_forward(
     N0 = input_m;
     M_mat = input_n;
 
+    printf("CHECKPOINT 4!\n");
     // Add attention output
     unsigned layer_norm = 1;
     struct mat *output = general_element_add(
@@ -2575,9 +2553,6 @@ static void EdgeBert_transformer_layers(
     int hidden_size_ffn
 ) {
     printf("Transformer Matmul Performance on EdgeBERT BEGIN...\n");
-
-    EdgeBert_init(dev, plic_dev, mem);
-
     // Initialize inputs
     struct mat *input = aligned_malloc(sizeof(struct mat));
     token_t *val_input = aligned_malloc(input_m * input_n);
@@ -2617,7 +2592,7 @@ static void EdgeBert_debugging_matmul(
     token_t *mem
 ) {
     int num_interrupts = 0;
-    int N0 = 64, M_mat = 768, N1 = 80;
+    int N0 = 128, M_mat = 768, N1 = 768;
 
     // Initialize weights
     struct mat *we_mat1 = aligned_malloc(sizeof(struct mat));
@@ -2918,7 +2893,8 @@ int main(int argc, char * argv[]) {
     printf("  #######   #           ######       ####    #     #    #####   \n");
 
     // Run transformer on CPU
-    // CPU_transformer(
+    // CPU_transformer_layers(
+    //     1,
     //     12,
     //     128,
     //     768,
@@ -2928,19 +2904,18 @@ int main(int argc, char * argv[]) {
     // );
 
     // // Run transformer on accelerator
-    // EdgeBert_transformer(
-    //     &dev,
-    //     &plic_dev,
-    //     mem,
-    //     12,
-    //     128,
-    //     768,
-    //     64,
-    //     2,
-    //     3072
-    // );
-
-    EdgeBert_debugging_matmul(&dev, &plic_dev, mem);
+    EdgeBert_transformer_layers(
+        &dev,
+        &plic_dev,
+        mem,
+        1,
+        12,
+        128,
+        768,
+        64,
+        2,
+        3072
+    );
 
     printf("FINISHing DRIVER\n");
     aligned_free(mem);
