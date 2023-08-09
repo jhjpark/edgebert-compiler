@@ -51,6 +51,7 @@ const static unsigned aux_buffer_size = 4096;
 const static int vector_size = 16;
 const static int adf_accum_bias = 2;
 const static int accum_right_shift_base = 4;
+const static int mask_scale = 4;
 
 // Used to calculate time (get current counter)
 static inline uint64_t get_counter() {
@@ -102,7 +103,7 @@ int min(int a, int b) {
 
 // Transpose for integer
 void CPU_transpose_int(int *array, int m, int n) {
-    int new_array[m * n];
+    int *new_array = aligned_malloc(m * n);
     for (int i = 0; i < m; i++) {
         for (int j = 0; j < n; j++) {
             // Index in the original matrix
@@ -118,6 +119,7 @@ void CPU_transpose_int(int *array, int m, int n) {
     for (int i = 0; i < m * n; i++) {
         array[i] = new_array[i];
     }
+    aligned_free(new_array);
 }
 
 // Softmax over array of size size (in-place)
@@ -380,7 +382,6 @@ static int *CPU_EdgeBert_attention(
     int hidden_size
 ) {
     printf("STARTing Attention Head in CPU...\n");
-
     // Initialize inputs, weights, and outputs
     int *we_query = aligned_malloc(input_n * hidden_size * sizeof(int));
     int *we_key = aligned_malloc(input_n * hidden_size * sizeof(int));
@@ -929,8 +930,8 @@ static int load_matrix(
     int M = M_mat / vector_size;
     // Master mask read (load from outside and store in accelerator MASK scratchpad) for decoder 0
     num_interrupts = master_mask_read(dev, plic_dev, mask_rd_base + mask_offset, decoder, M, num_interrupts);
+    M = M / mask_scale;
     // Load in data to decoder 0
-    M = M / bits_in_bytes;
     num_interrupts = master_input_read(dev, plic_dev, input_rd_base + input_offset, decoder, M, num_interrupts);
     return num_interrupts;
 }
@@ -993,7 +994,7 @@ static struct mat *write_matrix(
     int M = N1 / vector_size;
     num_interrupts = master_input_write(dev, plic_dev, M, num_interrupts);
     memcpy(output -> values, mem + 2 * mask_buffer_size + 2 * input_buffer_size + aux_buffer_size, N0 * N1);
-    M = M / bits_in_bytes;
+
     num_interrupts = master_mask_write(dev, plic_dev, M, num_interrupts);
     memcpy(output -> mask, mem + 2 * mask_buffer_size + 3 * input_buffer_size + aux_buffer_size, N0 * N1 / bits_in_bytes);
 
@@ -2407,6 +2408,7 @@ static struct mat *EdgeBert_feed_forward(
     unsigned weight_bias = 0;
     unsigned softmax = 0;
 
+    printf("CHECKPOINT 1!\n");
     struct mat *mat_output1 = general_mat_mul(
         dev,
         plic_dev,
@@ -2432,6 +2434,7 @@ static struct mat *EdgeBert_feed_forward(
     M_mat = hidden_size_ffn;
     N1 = input_n;
 
+    printf("CHECKPOINT 2!\n");
     struct mat *mat_output2 = general_mat_mul(
         dev,
         plic_dev,
@@ -2589,9 +2592,14 @@ static void EdgeBert_debugging_matmul(
     struct esp_device *plic_dev,
     token_t *mem
 ) {
+    int64_t count1;
+    uint64_t count2;
+    uint64_t exe_cycle;
+
     int num_interrupts = 0;
     int N0 = 128, M_mat = 768, N1 = 768;
 
+    count1 = get_counter();
     // Initialize weights
     struct mat *we_mat1 = aligned_malloc(sizeof(struct mat));
     token_t *val_mat1 = aligned_malloc(N0 * M_mat);
@@ -2605,20 +2613,27 @@ static void EdgeBert_debugging_matmul(
     int bias_input = 0;
     *input = (struct mat) {val_input, mask_input, bias_input};
 
-    // struct mat *output = aligned_malloc(sizeof(struct mat));
-    // token_t *val_output = aligned_malloc(N0 * N1);
-    // token_t *mask_output = aligned_malloc(N0 * N1 / bits_in_bytes);
-    // int bias_ouptut = 0;
-    // *output = (struct mat) {val_output, mask_output, bias_ouptut};
+    struct mat *output = aligned_malloc(sizeof(struct mat));
+    token_t *val_output = aligned_malloc(N0 * N1);
+    token_t *mask_output = aligned_malloc(N0 * N1 / bits_in_bytes);
+    int bias_ouptut = 0;
+    *output = (struct mat) {val_output, mask_output, bias_ouptut};
+    count2 = get_counter();
+    exe_cycle = count2 - count1;
+    printf("...Mallocing %d by %d by %d takes %"PRIu64" clock cycles...\n", N0, N1, M_mat, exe_cycle);
 
+    count1 = get_counter();
     // Load dummy data
     memset(val_mat1, 0b01001001, N0 * M_mat);
     memset(val_input, 0b01001001, M_mat * N1);
     memset(mask_mat1, 255, N0 * M_mat / bits_in_bytes);
     memset(mask_input, 255, M_mat * N1 / bits_in_bytes);
+    count2 = get_counter();
+    exe_cycle = count2 - count1;
+    printf("...Memsetting %d by %d by %d takes %"PRIu64" clock cycles...\n", N0, N1, M_mat, exe_cycle);
 
     EdgeBert_init(dev, plic_dev, mem);
-    struct mat *output = general_mat_mul(
+    EdgeBert_mat_mul(
         dev,
         plic_dev,
         mem,
@@ -2631,7 +2646,7 @@ static void EdgeBert_debugging_matmul(
         0,
         0,
         0,
-        NULL
+        output
     );
 
     // printf("matmul output values\n");
